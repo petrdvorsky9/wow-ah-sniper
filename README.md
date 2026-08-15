@@ -90,6 +90,7 @@ an 8080 fallback). A few things worth knowing before you do, regardless of platf
   something shared (e.g. Redis) instead.
 
 **Option A: Render.com (`render.yaml`) — genuinely free, no card required**
+*(full step-by-step walkthrough: [`DEPLOY_RENDER.md`](DEPLOY_RENDER.md))*
 
 Render's free "Hobby" web service gives 512MB RAM / 0.1 CPU, 750 free instance-hours
 per workspace per month (a personal/low-traffic tool like this stays well within that,
@@ -193,6 +194,7 @@ Or set `source: blizzard` on individual items in `watchlist.yaml` to mix sources
 | `.env` | Your API credentials (never committed) |
 | `Dockerfile` | Container image for deploying the web app (see "Deploying publicly" below) |
 | `render.yaml` | Render.com Blueprint config, used when deploying via Render's dashboard |
+| `DEPLOY_RENDER.md` | Step-by-step Render.com deployment walkthrough |
 | `fly.toml` | Fly.io app config used by `fly launch`/`fly deploy` |
 
 ## Notes
