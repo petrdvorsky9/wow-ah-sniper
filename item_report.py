@@ -56,6 +56,14 @@ BASELINE_WINDOW_DAYS = 30
 RECOMMENDATION_THRESHOLD_PCT = 0.10  # how far from baseline before Buy/Sell instead of Hold
 AH_SALE_CUT_PCT = 0.05  # WoW auction house's cut taken on a successful sale
 
+# 60 days rather than 30: the prediction's weekday-seasonality component needs
+# several samples per weekday to be stable (60d ≈ 8-9 samples/weekday vs. ≈4 at
+# 30d), and the extra history also gives the trend line more to work with.
+PREDICTION_WINDOW_DAYS = 60
+PREDICTION_MIN_WINDOW_DAYS = 14  # below this, both trend and seasonality are too noisy to trust
+PREDICTION_HORIZON_DAYS = 14
+PREDICTION_FLAT_THRESHOLD_PCT = 3.0  # +/- this over the horizon counts as "flat" not rising/falling
+
 # ── copper helpers ─────────────────────────────────────────────────────────────
 
 def copper_to_gold(copper: int) -> float:
@@ -361,6 +369,201 @@ def render_weekday_heatmap_html(heatmap: dict | None, current_price_copper: int 
         "</div>"
         f'<div class="heatmap-note">Based on ~{heatmap["avg_samples"]:.1f} days per weekday '
         f'over the last {heatmap["window_days"]}d.</div>'
+    )
+
+
+# ── price prediction (trend + weekday seasonality) ──────────────────────────────
+
+def _linear_regression(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    """Least-squares slope/intercept for y = slope*x + intercept."""
+    n = len(xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom if denom else 0.0
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def _stdev(values: list[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return (sum((v - mean) ** 2 for v in values) / (n - 1)) ** 0.5
+
+
+def compute_price_prediction(
+    daily: list[DailySnapshot] | None,
+    window_days: int = PREDICTION_WINDOW_DAYS,
+    horizon_days: int = PREDICTION_HORIZON_DAYS,
+) -> dict | None:
+    """Forecast the next `horizon_days` of daily average price from the last
+    `window_days` of daily history (or fewer if that's all Undermine has).
+
+    Method — deliberately simple/explainable rather than a black-box model,
+    consistent with the baseline/heatmap logic above:
+      1. Fit a linear trend (least-squares regression on day index) to capture
+         overall drift over the window.
+      2. Layer a per-weekday seasonal offset on top: each weekday's average
+         deviation from its own trend value (same idea as `compute_weekday_heatmap`,
+         applied forward instead of backward).
+      3. Widen the confidence band by sqrt(days-ahead), since a random-walk-style
+         forecast's uncertainty compounds the further out it goes.
+
+    Returns None if there's too little daily history (< `PREDICTION_MIN_WINDOW_DAYS`
+    valid days) for the trend/seasonality split to be meaningful.
+    """
+    if not daily:
+        return None
+
+    window = [d for d in daily[-window_days:] if d.price_copper > 0]
+    if len(window) < PREDICTION_MIN_WINDOW_DAYS:
+        return None
+
+    n = len(window)
+    xs = list(range(n))
+    ys = [float(d.price_copper) for d in window]
+    dates = [datetime.strptime(d.day, "%Y-%m-%d") for d in window]
+
+    slope, intercept = _linear_regression(xs, ys)
+
+    weekday_residuals: dict[str, list[float]] = defaultdict(list)
+    for x, y, dt in zip(xs, ys, dates):
+        weekday_residuals[dt.strftime("%a")].append(y - (slope * x + intercept))
+    weekday_adj = {wd: sum(vals) / len(vals) for wd, vals in weekday_residuals.items()}
+
+    residuals_flat = [
+        y - (slope * x + intercept) - weekday_adj[dt.strftime("%a")]
+        for x, y, dt in zip(xs, ys, dates)
+    ]
+    noise_std = _stdev(residuals_flat)
+
+    last_date = dates[-1]
+    forecast = []
+    for step in range(1, horizon_days + 1):
+        future_x = n - 1 + step
+        future_date = last_date + timedelta(days=step)
+        wd = future_date.strftime("%a")
+        predicted = max(0.0, slope * future_x + intercept + weekday_adj.get(wd, 0.0))
+        band = noise_std * (step ** 0.5)
+        forecast.append({
+            "date": future_date.strftime("%Y-%m-%d"),
+            "price_copper": int(round(predicted)),
+            "low_copper": int(round(max(0.0, predicted - band))),
+            "high_copper": int(round(predicted + band)),
+        })
+
+    avg_price = sum(ys) / n
+    last_actual = ys[-1]
+    day_horizon_price = forecast[-1]["price_copper"]
+    total_change_pct = (
+        (day_horizon_price - last_actual) / last_actual * 100 if last_actual else 0.0
+    )
+    if total_change_pct >= PREDICTION_FLAT_THRESHOLD_PCT:
+        trend_direction = "rising"
+    elif total_change_pct <= -PREDICTION_FLAT_THRESHOLD_PCT:
+        trend_direction = "falling"
+    else:
+        trend_direction = "flat"
+
+    coeff_of_variation = (noise_std / avg_price) if avg_price else 1.0
+    if n >= 45 and coeff_of_variation < 0.15:
+        confidence = "high"
+    elif n >= 21 and coeff_of_variation < 0.30:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return {
+        "window_days": n,
+        "horizon_days": horizon_days,
+        "trend_direction": trend_direction,
+        "total_change_pct": total_change_pct,
+        "confidence": confidence,
+        "history": [{"date": d.day, "price_copper": d.price_copper} for d in window],
+        "forecast": forecast,
+    }
+
+
+_PREDICTION_TREND_META = {
+    "rising": {"pill_class": "pill-sell", "label": "Rising", "arrow": "\u2191"},
+    "falling": {"pill_class": "pill-buy", "label": "Falling", "arrow": "\u2193"},
+    "flat": {"pill_class": "pill-hold", "label": "Flat", "arrow": "\u2192"},
+}
+_PREDICTION_CONFIDENCE_COLOR = {
+    "high": "var(--green)", "medium": "var(--gold)", "low": "var(--pink)",
+}
+
+
+def render_prediction_tab_html(prediction: dict | None) -> str:
+    """Render the full contents of the Prediction tab: summary pills, a forecast
+    chart (built client-side from `DATA.prediction`), and a day-by-day table — or
+    a fallback message if there isn't enough daily history yet."""
+    if not prediction:
+        return (
+            '<div class="card">'
+            '<div class="recipes-empty">Not enough daily history yet to build a '
+            f"{PREDICTION_HORIZON_DAYS}-day price prediction (need at least "
+            f"{PREDICTION_MIN_WINDOW_DAYS} days of data for this item).</div>"
+            "</div>"
+        )
+
+    forecast = prediction["forecast"]
+    day_horizon = forecast[-1]
+    direction = prediction["trend_direction"]
+    meta = _PREDICTION_TREND_META[direction]
+    confidence = prediction["confidence"]
+
+    pills = (
+        '<div class="headline" style="margin-bottom:18px;">'
+        f'<div class="pill"><div class="label">In {prediction["horizon_days"]} Days</div>'
+        f'<div class="value" style="color:var(--purple);">{html_escape(fmt_gold(day_horizon["price_copper"]))}</div>'
+        f'<div class="pill-sub">{html_escape(fmt_gold(day_horizon["low_copper"]))} &ndash; '
+        f'{html_escape(fmt_gold(day_horizon["high_copper"]))}</div></div>'
+        f'<div class="pill {meta["pill_class"]}"><div class="label">Trend</div>'
+        f'<div class="value">{meta["arrow"]} {meta["label"]}</div>'
+        f'<div class="pill-sub">{prediction["total_change_pct"]:+.1f}% over {prediction["horizon_days"]}d</div></div>'
+        '<div class="pill"><div class="label">Confidence</div>'
+        f'<div class="value" style="color:{_PREDICTION_CONFIDENCE_COLOR[confidence]};">{confidence.title()}</div>'
+        f'<div class="pill-sub">based on {prediction["window_days"]}d of history</div></div>'
+        "</div>"
+    )
+
+    rows = []
+    for f in forecast:
+        dt = datetime.strptime(f["date"], "%Y-%m-%d")
+        rows.append(
+            "<tr>"
+            f'<td>{dt.strftime("%a %b %d")}</td>'
+            f'<td class="price-cell">{html_escape(fmt_gold(f["price_copper"]))}</td>'
+            f'<td class="muted-cell">{html_escape(fmt_gold(f["low_copper"]))} &ndash; '
+            f'{html_escape(fmt_gold(f["high_copper"]))}</td>'
+            "</tr>"
+        )
+    table = (
+        '<table class="recipes-table">'
+        "<thead><tr><th>Date</th><th>Predicted Price</th><th>Range</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+
+    return (
+        f"{pills}"
+        '<div class="grid-bottom">'
+        '<div class="card">'
+        f'<h3>Price Forecast &middot; Next {prediction["horizon_days"]}d</h3>'
+        '<div class="chart-wrap xl"><canvas id="chartPrediction"></canvas></div>'
+        '<div class="heatmap-note">Linear trend + weekday seasonality projected from the last '
+        f'{prediction["window_days"]}d of daily history. Shaded band = uncertainty range, '
+        "widening the further out the forecast goes. Directional guidance only — not a guarantee."
+        "</div>"
+        "</div>"
+        '<div class="card">'
+        "<h3>Day-by-Day Forecast</h3>"
+        f"{table}"
+        "</div>"
+        "</div>"
     )
 
 
@@ -980,6 +1183,14 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   header h1 a { color: var(--text); text-decoration: none; border-bottom: 1px dashed var(--muted); }
   header h1 a:hover { color: var(--gold); border-bottom-color: var(--gold); }
   header .meta { color: var(--muted); font-size: 13px; }
+  .header-title { display: flex; align-items: center; gap: 12px; }
+  .back-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px; flex-shrink: 0;
+    border: 1px solid var(--card-border); border-radius: 8px;
+    color: var(--muted); text-decoration: none; font-size: 17px; line-height: 1;
+  }
+  .back-btn:hover { color: var(--gold); border-color: var(--gold); background: rgba(240,192,64,0.08); }
   .headline {
     display: flex;
     gap: 14px;
@@ -1126,6 +1337,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .mat-tooltip .source-mat { color: var(--gold); }
   .mat-tooltip .profit-pos { color: var(--green); font-weight: 700; }
   .mat-tooltip .profit-neg { color: var(--pink); font-weight: 700; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--card-border); }
+  .tab-btn {
+    background: none; border: none; color: var(--muted); font-size: 13px; font-weight: 600;
+    font-family: inherit; padding: 10px 6px; margin: 0 10px -1px 0; cursor: pointer;
+    border-bottom: 2px solid transparent;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--gold); border-bottom-color: var(--gold); }
+  .tab-content.hidden { display: none; }
   footer { margin-top: 22px; color: var(--muted); font-size: 11px; }
 
   @media (max-width: 860px) {
@@ -1166,7 +1386,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1><a href="__WOWHEAD_URL__" target="_blank" rel="noopener noreferrer">__ITEM_NAME__</a></h1>
+  <div class="header-title">
+    <a class="back-btn" href="/" title="Back to search">&larr;</a>
+    <h1><a href="__WOWHEAD_URL__" target="_blank" rel="noopener noreferrer">__ITEM_NAME__</a></h1>
+  </div>
   <div class="meta">__SCOPE__ &middot; __UPDATED__</div>
 </header>
 
@@ -1178,33 +1401,44 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   __RECOMMENDATION_PILL__
 </div>
 
-<div class="grid-top">
-  <div class="card">
-    <h3>Daily Price Range &middot; 14d</h3>
-    <div class="chart-wrap"><canvas id="chartDailyRange"></canvas></div>
+<div class="tabs">
+  <button class="tab-btn active" data-tab="overview" type="button">Overview</button>
+  <button class="tab-btn" data-tab="prediction" type="button">Prediction</button>
+</div>
+
+<div id="tab-overview" class="tab-content">
+  <div class="grid-top">
+    <div class="card">
+      <h3>Daily Price Range &middot; 14d</h3>
+      <div class="chart-wrap"><canvas id="chartDailyRange"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Weekday Buy/Sell Pattern &middot; __BASELINE_WINDOW_DAYS__d</h3>
+      __WEEKDAY_HEATMAP__
+    </div>
   </div>
-  <div class="card">
-    <h3>Weekday Buy/Sell Pattern &middot; __BASELINE_WINDOW_DAYS__d</h3>
-    __WEEKDAY_HEATMAP__
+
+  <div class="grid-bottom">
+    <div class="card">
+      <h3>Price &amp; Volume Trend &middot; 7d</h3>
+      <div class="chart-wrap xl"><canvas id="chartPriceVolume"></canvas></div>
+      <div class="stat-row">
+        <div><div class="stat-label">Current Price</div><div class="stat-value" style="color:var(--gold);">__CUR_PRICE__</div></div>
+        <div><div class="stat-label">24h Min</div><div class="stat-value">__H24_MIN__</div></div>
+        <div><div class="stat-label">24h Max</div><div class="stat-value">__H24_MAX__</div></div>
+      </div>
+      <div class="stat-row">
+        <div><div class="stat-label">Current Qty</div><div class="stat-value" style="color:var(--blue);">__CUR_QTY__</div></div>
+        <div><div class="stat-label">Avg Qty 7d</div><div class="stat-value">__AVG_QTY_7D__</div></div>
+        <div><div class="stat-label">Avg Qty 14d</div><div class="stat-value">__AVG_QTY_14D__</div></div>
+      </div>
+    </div>
+    __RECIPES_CARD__
   </div>
 </div>
 
-<div class="grid-bottom">
-  <div class="card">
-    <h3>Price &amp; Volume Trend &middot; 7d</h3>
-    <div class="chart-wrap xl"><canvas id="chartPriceVolume"></canvas></div>
-    <div class="stat-row">
-      <div><div class="stat-label">Current Price</div><div class="stat-value" style="color:var(--gold);">__CUR_PRICE__</div></div>
-      <div><div class="stat-label">24h Min</div><div class="stat-value">__H24_MIN__</div></div>
-      <div><div class="stat-label">24h Max</div><div class="stat-value">__H24_MAX__</div></div>
-    </div>
-    <div class="stat-row">
-      <div><div class="stat-label">Current Qty</div><div class="stat-value" style="color:var(--blue);">__CUR_QTY__</div></div>
-      <div><div class="stat-label">Avg Qty 7d</div><div class="stat-value">__AVG_QTY_7D__</div></div>
-      <div><div class="stat-label">Avg Qty 14d</div><div class="stat-value">__AVG_QTY_14D__</div></div>
-    </div>
-  </div>
-  __RECIPES_CARD__
+<div id="tab-prediction" class="tab-content hidden">
+  __PREDICTION_TAB__
 </div>
 
 <footer>Data: Undermine Exchange API &middot; generated __GENERATED_AT__</footer>
@@ -1266,6 +1500,79 @@ new Chart(document.getElementById("chartPriceVolume"), {
   },
 });
 
+function createPredictionChart() {
+  const p = DATA.prediction;
+  const canvas = document.getElementById("chartPrediction");
+  if (!p || !canvas) return;
+
+  // Pad each series to the full (history + forecast) length so both lines share
+  // one x-axis, and repeat the last historical point as the forecast's first
+  // point so the dashed line connects to the solid one with no visual gap.
+  const labels = p.historyLabels.concat(p.forecastLabels);
+  const nHist = p.historyLabels.length;
+  const lastActual = p.historyPrices[nHist - 1];
+
+  const historyData = p.historyPrices.concat(Array(p.forecastLabels.length).fill(null));
+  const forecastData = Array(nHist - 1).fill(null).concat([lastActual], p.forecastPrices);
+  const upperData = Array(nHist - 1).fill(null).concat([lastActual], p.forecastHigh);
+  const lowerData = Array(nHist - 1).fill(null).concat([lastActual], p.forecastLow);
+
+  new Chart(canvas, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Upper bound", data: upperData, borderWidth: 0, pointRadius: 0,
+          fill: false, tension: 0.2,
+        },
+        {
+          label: "Lower bound", data: lowerData, borderWidth: 0, pointRadius: 0,
+          backgroundColor: "rgba(139,92,246,0.15)", fill: "-1", tension: 0.2,
+        },
+        {
+          label: "Historical", data: historyData, borderColor: "#f0c040",
+          backgroundColor: "rgba(240,192,64,0.1)", fill: false, tension: 0.2,
+          pointRadius: 0, borderWidth: 2,
+        },
+        {
+          label: "Forecast", data: forecastData, borderColor: "#8b5cf6",
+          borderDash: [6, 4], fill: false, tension: 0.2, pointRadius: 0, borderWidth: 2,
+        },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          position: "top", labels: { boxWidth: 10, font: { size: 10 } },
+          filter: (item) => item.text !== "Upper bound" && item.text !== "Lower bound",
+        },
+      },
+      scales: {
+        y: { ticks: { callback: (v) => v + "g" } },
+        x: { ticks: { maxTicksLimit: 10, font: { size: 9 } } },
+      },
+    },
+  });
+}
+
+const tabBtns = document.querySelectorAll(".tab-btn");
+let predictionChartCreated = false;
+tabBtns.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    tabBtns.forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    document.querySelectorAll(".tab-content").forEach((c) => c.classList.add("hidden"));
+    document.getElementById("tab-" + btn.dataset.tab).classList.remove("hidden");
+    if (btn.dataset.tab === "prediction" && !predictionChartCreated) {
+      createPredictionChart();
+      predictionChartCreated = true;
+    }
+  });
+});
+
 </script>
 </body>
 </html>
@@ -1313,6 +1620,7 @@ def render_html_report(
     baseline: dict | None = None,
     recommendation: dict | None = None,
     weekday_heatmap: dict | None = None,
+    prediction: dict | None = None,
 ) -> str:
     """Build a self-contained Chart.js dashboard HTML report and return it as a string.
 
@@ -1345,6 +1653,23 @@ def render_html_report(
         except Exception:
             updated_str = f"updated {last_updated}"
 
+    prediction_js = None
+    if prediction:
+        history = prediction["history"]
+        forecast = prediction["forecast"]
+        prediction_js = {
+            "historyLabels": [
+                datetime.strptime(h["date"], "%Y-%m-%d").strftime("%b %d") for h in history
+            ],
+            "historyPrices": [round(copper_to_gold(h["price_copper"]), 2) for h in history],
+            "forecastLabels": [
+                datetime.strptime(f["date"], "%Y-%m-%d").strftime("%b %d") for f in forecast
+            ],
+            "forecastPrices": [round(copper_to_gold(f["price_copper"]), 2) for f in forecast],
+            "forecastLow": [round(copper_to_gold(f["low_copper"]), 2) for f in forecast],
+            "forecastHigh": [round(copper_to_gold(f["high_copper"]), 2) for f in forecast],
+        }
+
     data = {
         "dailyDates": [datetime.strptime(d, "%Y-%m-%d").strftime("%b %d") for d, _ in last_14],
         "dailyMin": [round(copper_to_gold(v["min"]), 2) for _, v in last_14],
@@ -1352,6 +1677,7 @@ def render_html_report(
         "hourlyLabels": [parse_dt(s.snapshot).strftime("%b %d %Hh") for s in snapshots_7d],
         "hourlyPrice": [round(copper_to_gold(s.price_copper), 2) for s in snapshots_7d],
         "hourlyQty": [s.quantity for s in snapshots_7d],
+        "prediction": prediction_js,
     }
 
     html = (
@@ -1374,6 +1700,7 @@ def render_html_report(
         .replace("__RECIPES_CARD__", render_recipes_card(recipe_rows, item_name))
         .replace("__RECOMMENDATION_PILL__", render_recommendation_pill(baseline, recommendation))
         .replace("__WEEKDAY_HEATMAP__", render_weekday_heatmap_html(weekday_heatmap, current_price))
+        .replace("__PREDICTION_TAB__", render_prediction_tab_html(prediction))
         .replace(
             "__BASELINE_WINDOW_DAYS__",
             str(weekday_heatmap["window_days"] if weekday_heatmap else BASELINE_WINDOW_DAYS),
@@ -1413,6 +1740,7 @@ def print_report(
     chart_path: Path | None,
     baseline: dict | None = None,
     recommendation: dict | None = None,
+    prediction: dict | None = None,
 ) -> None:
     now_utc = datetime.now(timezone.utc)
     scope = "EU Region (Commodity)" if commodity else f"{realm.title()} / {region.upper()}"
@@ -1459,6 +1787,13 @@ def print_report(
                 f"  {'':<16}  List at {fmt_gold(target_sell)} for +{profit_pct:.0f}% profit "
                 "on today's price, after the AH cut"
             )
+    if prediction:
+        day_h = prediction["forecast"][-1]
+        print(
+            f"  {prediction['horizon_days']}d forecast   {fmt_gold(day_h['price_copper']):<24}  "
+            f"{prediction['trend_direction'].upper()} ({prediction['total_change_pct']:+.1f}%, "
+            f"{prediction['confidence']} confidence, {prediction['window_days']}d history)"
+        )
     print(f"{sep}")
     print(f"  14-day daily price ranges  (hourly min – max)")
     print(f"  {'Date':<12}  {'Min':>14}  {'Max':>14}  {'Avg qty':>9}  Chart")
@@ -1501,6 +1836,7 @@ def build_json(
     baseline: dict | None = None,
     recommendation: dict | None = None,
     weekday_heatmap: dict | None = None,
+    prediction: dict | None = None,
 ) -> dict:
     h24 = [s for s in last_n_hours(snapshots_all, 24) if s.price_copper > 0]
     hist_14d = last_n_days(snapshots_all, DAILY_HISTORY_DAYS)
@@ -1531,6 +1867,7 @@ def build_json(
         "baseline": baseline,
         "recommendation": recommendation,
         "weekday_heatmap": weekday_heatmap,
+        "prediction": prediction,
     }
 
 
@@ -1612,13 +1949,14 @@ def generate_report(
     baseline = compute_baseline(daily)
     recommendation = compute_recommendation(quote.price_copper, baseline)
     weekday_heatmap = compute_weekday_heatmap(daily)
+    prediction = compute_price_prediction(daily)
 
     html = render_html_report(
         item_name, item_id, commodity, realm, region,
         quote.price_copper, quote.quantity, quote.last_updated,
         hourly, html_path, recipe_rows=recipe_rows,
         baseline=baseline, recommendation=recommendation,
-        weekday_heatmap=weekday_heatmap,
+        weekday_heatmap=weekday_heatmap, prediction=prediction,
     )
 
     return {
@@ -1629,6 +1967,7 @@ def generate_report(
         "baseline": baseline,
         "recommendation": recommendation,
         "weekday_heatmap": weekday_heatmap,
+        "prediction": prediction,
     }
 
 
@@ -1733,6 +2072,7 @@ def main() -> None:
     baseline = result["baseline"]
     recommendation = result["recommendation"]
     weekday_heatmap = result["weekday_heatmap"]
+    prediction = result["prediction"]
 
     if html_path is not None:
         print(f"HTML report saved -> {html_path}", file=sys.stderr)
@@ -1745,7 +2085,7 @@ def main() -> None:
                 now_quote.price_copper, now_quote.quantity,
                 now_quote.last_updated, hourly, chart_path,
                 baseline=baseline, recommendation=recommendation,
-                weekday_heatmap=weekday_heatmap,
+                weekday_heatmap=weekday_heatmap, prediction=prediction,
             ),
             indent=2,
         ))
@@ -1755,6 +2095,7 @@ def main() -> None:
             now_quote.price_copper, now_quote.quantity,
             now_quote.last_updated, hourly, chart_path,
             baseline=baseline, recommendation=recommendation,
+            prediction=prediction,
         )
 
 
