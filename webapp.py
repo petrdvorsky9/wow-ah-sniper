@@ -208,6 +208,16 @@ _PAGE_SHELL = """<!DOCTYPE html>
   .back:hover { color: var(--gold); border-bottom-color: var(--gold); }
   .hint { color: var(--muted); font-size: 12px; margin-top: 14px; }
   .hint code { color: var(--text); }
+  .notice {
+    background: rgba(240,192,64,0.08);
+    border: 1px solid rgba(240,192,64,0.35);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 12px;
+    line-height: 1.5;
+    margin-top: 16px;
+  }
 </style>
 </head>
 <body>
@@ -316,6 +326,11 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
 <div class="hint">
   Commodity vs. realm scope is auto-detected. Examples: <code>2770</code>,
   <code>Copper Ore</code>, <code>wowhead.com/item=23540/felsteel-longblade</code>.
+</div>
+<div class="notice">
+  This app is currently under active development. You may encounter bugs, unexpected
+  behavior, or incomplete features. Thanks for your patience while improvements are
+  being made!
 </div>
 {render_flask_overview()}
 """
