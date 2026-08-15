@@ -1,0 +1,26 @@
+# Render.com Blueprint for the WoW AH Sniper web app.
+#
+# First-time setup:
+#   1. Push this repo to GitHub/GitLab (Render deploys from a git remote, not a local
+#      folder).
+#   2. In the Render dashboard: New -> Blueprint -> pick this repo. Render reads this
+#      file (at the repo root) and creates the service below automatically.
+#   3. When prompted, set the UNDERMINE_API_KEY secret (see envVars below) — Render
+#      will ask for any "sync: false" values during setup.
+#   4. Deploy. Future git pushes to your default branch auto-deploy.
+#
+# Runs on the free Hobby plan (see README's "Deploying publicly" section for what
+# that includes/limits) — no credit card required.
+
+services:
+  - type: web
+    name: wow-ah-sniper
+    runtime: docker
+    plan: free
+    region: frankfurt        # closest Render region to EU AH data; change to taste
+    healthCheckPath: /
+    envVars:
+      - key: PYTHONIOENCODING
+        value: utf-8
+      - key: UNDERMINE_API_KEY
+        sync: false           # set this in the Render dashboard — never commit a real key

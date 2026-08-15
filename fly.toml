@@ -1,0 +1,39 @@
+# Fly.io app config for the WoW AH Sniper web app.
+#
+# First-time setup:
+#   1. Install flyctl: https://fly.io/docs/flyctl/install/
+#   2. fly auth login
+#   3. fly launch --no-deploy   (creates/renames the app, picks a region; when it asks
+#      to copy config from this fly.toml, say yes; skip Postgres/Redis prompts)
+#   4. fly secrets set UNDERMINE_API_KEY=your-key-here
+#   5. fly deploy
+#
+# After that, `fly deploy` alone re-deploys any code changes.
+
+app = "wow-ah-sniper"       # must be globally unique on Fly — `fly launch` will
+                             # prompt to rename this if it's taken
+primary_region = "ams"      # Amsterdam — closest to EU; change to taste (e.g. "iad" for US-East)
+
+[build]
+
+[env]
+  PYTHONIOENCODING = "utf-8"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"    # scale to zero when idle (free-tier friendly)
+  auto_start_machines = true     # wake back up automatically on the next request
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/"
+    timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512

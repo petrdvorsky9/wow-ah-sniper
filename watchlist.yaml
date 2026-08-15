@@ -1,0 +1,40 @@
+# Items to watch on the WoW Auction House.
+#
+# Fields:
+#   name          - Display label (cosmetic, doesn't affect the query).
+#   item_id       - WoW item ID (look it up on wowhead.com/item=ID).
+#   region        - one of: us, eu, tw, kr
+#   commodity     - true for stackable trade-goods on the region-wide Commodity AH
+#                   (ore, herbs, cloth, enchanting mats, etc.).
+#                   false for gear, mounts, pets — these are realm-specific.
+#   realm         - Required when commodity is false. Realm slug, e.g. drakthul,
+#                   burning-blade. Connected realms share one AH; any slug in the
+#                   connected group works.
+#   max_price_gold - Alert (<<< DEAL!) when price drops to or below this (in gold).
+#   source        - Data source: "undermine" (default/main) or "blizzard".
+#                   Omit to use the default source (--source flag or undermine).
+
+items:
+  # Commodity via Undermine Exchange (default source)
+  - name: Petrified Root
+    item_id: 251285
+    region: eu
+    commodity: true
+    max_price_gold: 400
+
+  # Same item via Blizzard's own AH API — shows live individual listings
+  # instead of Undermine's aggregated price
+  # - name: Petrified Root (Blizzard)
+  #   item_id: 251285
+  #   region: eu
+  #   commodity: true
+  #   max_price_gold: 400
+  #   source: blizzard
+
+  # Non-commodity realm item
+  # - name: Invincible's Reins
+  #   item_id: 50818
+  #   region: eu
+  #   commodity: false
+  #   realm: drakthul
+  #   max_price_gold: 500000

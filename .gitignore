@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+
+# Generated per-run report artifacts (regenerate via item_report.py/webapp.py)
+item_*.html
+item_*.png
+_webapp_stderr.log
+_webapp_stdout.log
+_debug_*.html
+debug_*.html
+debug_*.png

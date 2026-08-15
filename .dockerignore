@@ -1,0 +1,11 @@
+.venv
+__pycache__
+*.pyc
+.env
+.env.example
+*.png
+item_*.html
+watchlist.yaml
+.git
+.gitignore
+README.md
