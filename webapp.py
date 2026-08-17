@@ -107,7 +107,7 @@ def get_flask_overview_cached() -> list[dict]:
 
 # ── Midnight short-flip ribbon cache (avoids refetching on every landing-page hit) ─
 
-FLIP_RIBBON_TTL_SECONDS = 600
+FLIP_RIBBON_TTL_SECONDS = 1200
 _flip_ribbon_cache: dict = {"rows": None, "fetched_at": 0.0}
 
 
