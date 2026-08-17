@@ -874,6 +874,26 @@ MIDNIGHT_TRADE_GOODS = [
 # Every entry above is confirmed against live Wowhead item data (see the "quality"
 # field on each, matching Wowhead's/Blizzard's own item-rarity scale below) as a
 # Midnight-expansion item id — nothing here is reused/ported from Dragonflight.
+
+
+def get_midnight_quality_rank(item_id: int) -> str | None:
+    """The crafting-quality tier label ("Lower quality" / "Higher quality" /
+    "Only quality") for a Midnight item, if known — same terminology used on the
+    landing-page flip ribbons and the Midnight Flasks box. Looked up from
+    `MIDNIGHT_TRADE_GOODS` (raw materials — most have a lower/higher quality pair
+    of item ids, see the comment above that list) and `MIDNIGHT_FLASKS` (always
+    the higher-quality/max recipe rank). Returns None if this item id isn't one
+    we've researched a quality split for — e.g. it's not a Midnight item at all,
+    or it's a Midnight item whose quality tiers we haven't looked up yet."""
+    for good in MIDNIGHT_TRADE_GOODS:
+        if good["item_id"] == item_id:
+            return good["rank"]
+    for flask in MIDNIGHT_FLASKS:
+        if flask["item_id"] == item_id:
+            return "Higher quality"
+    return None
+
+
 CATEGORY_LABELS = {
     "flask": "Flask", "phial": "Phial", "potion": "Potion", "material": "Herb",
     "leather": "Leather", "ore": "Ore", "crystal": "Enchanting", "gem": "Gem",
@@ -1711,6 +1731,10 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   header h1 a:hover { color: var(--gold); border-bottom-color: var(--gold); }
   header .meta { color: var(--muted); font-size: 13px; }
   .header-title { display: flex; align-items: center; gap: 12px; }
+  .quality-badge {
+    font-size: 11px; font-weight: 600; color: var(--muted); white-space: nowrap;
+    background: rgba(255,255,255,0.06); border-radius: 6px; padding: 4px 9px;
+  }
   .back-btn {
     display: inline-flex; align-items: center; justify-content: center;
     width: 32px; height: 32px; flex-shrink: 0;
@@ -1916,6 +1940,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="header-title">
     <a class="back-btn" href="/" title="Back to search">&larr;</a>
     <h1><a href="__WOWHEAD_URL__" target="_blank" rel="noopener noreferrer">__ITEM_NAME__</a></h1>
+    __QUALITY_BADGE__
   </div>
   <div class="meta">__SCOPE__ &middot; __UPDATED__</div>
 </header>
@@ -2171,6 +2196,11 @@ def render_html_report(
         int(sum(v["avg_qty"] for _, v in last_14) / len(last_14)) if last_14 else current_qty
     )
 
+    quality_rank = get_midnight_quality_rank(item_id)
+    quality_badge_html = (
+        f'<span class="quality-badge">&#9670; {html_escape(quality_rank)}</span>' if quality_rank else ""
+    )
+
     updated_str = "no data"
     if last_updated:
         try:
@@ -2212,6 +2242,7 @@ def render_html_report(
         .replace("__ITEM_NAME__", item_name)
         .replace("__ITEM_ID__", str(item_id))
         .replace("__WOWHEAD_URL__", f"https://www.wowhead.com/item={item_id}")
+        .replace("__QUALITY_BADGE__", quality_badge_html)
         .replace("__SCOPE__", scope)
         .replace("__UPDATED__", updated_str)
         .replace("__CUR_PRICE__", fmt_gold(current_price))

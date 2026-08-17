@@ -507,7 +507,7 @@ def _render_flip_card(r: dict) -> str:
         f'{sign}{html_escape(fmt_gold(abs(r["profit_copper"])))}'
         f'<div class="flip-card-profit-sub">{r["profit_pct"]:+.0f}% after 5% AH cut</div>'
         "</div>"
-        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
+        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=1">Report</a>'
         "</div>"
     )
 
