@@ -648,6 +648,252 @@ def build_flask_overview(client: UndermineClient, region: str = "eu") -> list[di
     return rows
 
 
+# ── Midnight short-flip ribbon (webapp landing page) ────────────────────────────
+
+# A small, hand-picked basket of Midnight commodities that are liquid enough (high
+# AH volume, short buy-now/sell-tomorrow holding period) to make sense for quick
+# flips, spanning the item types the ribbon is meant to cover. Flasks reuse the
+# higher-quality (ilvl 295) ids from MIDNIGHT_FLASKS; phials/potions likewise pick
+# the higher-quality rank where the two ranks are distinct items. Materials are the
+# five non-zone-locked base Midnight herbs (raw, ungathered — the most heavily
+# traded herb tier). Leather/ore/crystal/gem entries are the base (Silver-rank,
+# where two quality ranks exist as distinct item ids) Skinning, Mining, Enchanting,
+# and Jewelcrafting gathering/prospecting outputs — the highest-volume commodity
+# tier for each of those professions.
+#
+# `rank`: every raw-gathering reagent (herb/leather/ore/crystal/gem) in Midnight
+# exists as TWO separate item ids sharing one name — a cheaper "Silver" rank and a
+# pricier "Gold" rank (confirmed per-item against live Undermine/Wowhead data; e.g.
+# Void-Tempered Leather is 238511 Silver / 238512 Gold). We deliberately pick the
+# Silver id everywhere — it's the highest-volume, most-traded rank — so the ribbon
+# is comparing like-for-like, not accidentally quoting a rarer Gold-rank listing.
+# A few reagents (Tranquility Bloom, Dazzling Thorium) only have one rank at all.
+# Crafted consumables (flasks/phials/potions) work differently: they're a single
+# item id whose ilvl/power comes from the alchemist's recipe rank, so we pick the
+# max (highest ilvl) recipe rank instead, since that's the version most buyers want.
+MIDNIGHT_TRADE_GOODS = [
+    # Flasks
+    {
+        "item_id": 241320, "name": "Flask of Thalassian Resistance", "category": "flask",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_yellow", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    {
+        "item_id": 241322, "name": "Flask of the Magisters", "category": "flask",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_black", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    {
+        "item_id": 241324, "name": "Flask of the Blood Knights", "category": "flask",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_white-", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    {
+        "item_id": 241326, "name": "Flask of the Shattered Sun", "category": "flask",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_red--", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    # Phials (profession-stat consumables)
+    {
+        "item_id": 241310, "name": "Haranir Phial of Finesse", "category": "phial",
+        "icon": "inv_12_profession_alchemy_flask_haranirpotion_blue", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    {
+        "item_id": 241314, "name": "Haranir Phial of Concentrated Ingenuity", "category": "phial",
+        "icon": "inv_12_profession_alchemy_flask_haranirpotion_orange", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    {
+        "item_id": 241316, "name": "Haranir Phial of Perception", "category": "phial",
+        "icon": "inv_12_profession_alchemy_flask_haranirpotion_purple", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    # Potions
+    {
+        "item_id": 241304, "name": "Silvermoon Health Potion", "category": "potion",
+        "icon": "inv_12_profession_alchemy_lightpotion_orange", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    {
+        "item_id": 241306, "name": "Refreshing Serum", "category": "potion",
+        "icon": "inv_alchemy_80_potion01purple", "quality": 1, "rank": "Max rank (ilvl 295)",
+    },
+    # Materials (base Midnight herbs)
+    {
+        "item_id": 236761, "name": "Tranquility Bloom", "category": "material",
+        "icon": "inv_misc_herb_peacebloom", "quality": 1, "rank": "Only rank",
+    },
+    {
+        "item_id": 236774, "name": "Azeroot", "category": "material",
+        "icon": "inv_herb_earthroot", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 236776, "name": "Argentleaf", "category": "material",
+        "icon": "inv_misc_herb_silverleaf", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 236778, "name": "Mana Lily", "category": "material",
+        "icon": "inv_misc_herb_mageroyal", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 236771, "name": "Sanguithorn", "category": "material",
+        "icon": "inv_herb_bloodthistle", "quality": 2, "rank": "Silver rank",
+    },
+    # Leather/scales (base Midnight skinning materials)
+    {
+        "item_id": 238511, "name": "Void-Tempered Leather", "category": "leather",
+        "icon": "inv_12_profession_skinning_thalassianleather_brown", "quality": 1, "rank": "Silver rank",
+    },
+    {
+        "item_id": 238513, "name": "Void-Tempered Scales", "category": "leather",
+        "icon": "inv_12_profession_skinning_thalassianscale_violet", "quality": 1, "rank": "Silver rank",
+    },
+    # Ores (base Midnight mining materials)
+    {
+        "item_id": 237359, "name": "Refulgent Copper Ore", "category": "ore",
+        "icon": "inv_ore_refulgentcopper", "quality": 1, "rank": "Silver rank",
+    },
+    {
+        "item_id": 237362, "name": "Umbral Tin Ore", "category": "ore",
+        "icon": "inv_ore_umbraltin", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 237364, "name": "Brilliant Silver Ore", "category": "ore",
+        "icon": "inv_ore_brilliantsilver", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 237366, "name": "Dazzling Thorium", "category": "ore",
+        "icon": "inv_12_profession_mining_dazzlingthorium-", "quality": 3, "rank": "Only rank",
+    },
+    # Enchanting crystals/shards/dust (disenchanting byproducts)
+    {
+        "item_id": 243599, "name": "Eversinging Dust", "category": "crystal",
+        "icon": "inv_12_profession_enchanting_enchantingdust_green", "quality": 1, "rank": "Silver rank",
+    },
+    {
+        "item_id": 243602, "name": "Radiant Shard", "category": "crystal",
+        "icon": "inv_12_profession_enchanting_enchantingshard_blue", "quality": 3, "rank": "Silver rank",
+    },
+    {
+        "item_id": 243605, "name": "Dawn Crystal", "category": "crystal",
+        "icon": "inv_12_profession_enchanting_enchantingcrystal_orange", "quality": 4, "rank": "Silver rank",
+    },
+    # Gems (uncut Jewelcrafting prospecting output)
+    {
+        "item_id": 242553, "name": "Sanguine Garnet", "category": "gem",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_red", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 242554, "name": "Amani Lapis", "category": "gem",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_blue", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 242607, "name": "Harandar Peridot", "category": "gem",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_green", "quality": 2, "rank": "Silver rank",
+    },
+    {
+        "item_id": 242606, "name": "Tenebrous Amethyst", "category": "gem",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_purple", "quality": 2, "rank": "Silver rank",
+    },
+]
+
+# Every entry above is confirmed against live Wowhead item data (see the "quality"
+# field on each, matching Wowhead's/Blizzard's own item-rarity scale below) as a
+# Midnight-expansion item id — nothing here is reused/ported from Dragonflight.
+CATEGORY_LABELS = {
+    "flask": "Flask", "phial": "Phial", "potion": "Potion", "material": "Herb",
+    "leather": "Leather", "ore": "Ore", "crystal": "Enchanting", "gem": "Gem",
+}
+
+# WoW's standard item-rarity scale (color + label), keyed by the numeric "quality"
+# Wowhead reports in its tooltip JSON — used to badge each flip-ribbon card so it's
+# obvious at a glance whether an item is a common/white reagent or a rarer
+# uncommon/green, rare/blue, or epic/purple one (crafting materials in Midnight
+# don't all share one rarity — e.g. base ores are Common, some prospected gems and
+# disenchanting shards are Uncommon/Rare/Epic).
+QUALITY_META = {
+    0: ("Poor", "#9d9d9d"),
+    1: ("Common", "#ffffff"),
+    2: ("Uncommon", "#1eff00"),
+    3: ("Rare", "#0070dd"),
+    4: ("Epic", "#a335ee"),
+    5: ("Legendary", "#ff8000"),
+}
+
+# Below this net profit (after the AH cut), a buy-now/sell-tomorrow flip isn't worth
+# the overnight price risk — filters noise-level "profit" out of the ribbon.
+MIN_FLIP_PROFIT_PCT = 2.0
+
+
+def compute_tomorrow_flip(
+    current_price_copper: int | None,
+    heatmap: dict | None,
+    sale_cut_pct: float = AH_SALE_CUT_PCT,
+) -> dict | None:
+    """"Buy now, sell tomorrow" call for one item: compares today's price to
+    tomorrow's historical average (from the weekday heatmap), net of the AH's
+    sale_cut_pct cut. Returns None if there's no current price or no weekday
+    history for tomorrow specifically (too few samples for that weekday)."""
+    if not current_price_copper or current_price_copper <= 0 or not heatmap:
+        return None
+
+    tomorrow_wd = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%a")
+    day = next(
+        (d for d in heatmap["days"] if d["weekday"] == tomorrow_wd and d["samples"] > 0), None,
+    )
+    if not day or day["avg_price_copper"] is None:
+        return None
+
+    tomorrow_avg_copper = day["avg_price_copper"]
+    net_sell_copper = tomorrow_avg_copper * (1 - sale_cut_pct)
+    profit_copper = int(round(net_sell_copper - current_price_copper))
+    profit_pct = profit_copper / current_price_copper * 100
+
+    return {
+        "tomorrow_weekday": tomorrow_wd,
+        "tomorrow_avg_copper": tomorrow_avg_copper,
+        "net_sell_copper": int(round(net_sell_copper)),
+        "profit_copper": profit_copper,
+        "profit_pct": profit_pct,
+        "samples": day["samples"],
+    }
+
+
+def build_flip_ribbon(
+    client: UndermineClient,
+    region: str = "eu",
+    limit: int = 8,
+    min_profit_pct: float = MIN_FLIP_PROFIT_PCT,
+) -> list[dict]:
+    """Rank `MIDNIGHT_TRADE_GOODS` by "buy now, sell tomorrow" net profit (after the
+    AH's sale cut) and return the top `limit` still-profitable picks, for the webapp
+    landing page's short-flip ribbon.
+
+    Best-effort per item: one Undermine doesn't track yet, or with too little daily
+    history to know tomorrow's weekday pattern, is silently skipped rather than
+    failing the whole ribbon. Items below `min_profit_pct` net profit are excluded
+    outright (not worth the overnight price risk), so the result can be shorter
+    than `limit` — or empty, if nothing clears the bar today.
+    """
+    rows = []
+    for good in MIDNIGHT_TRADE_GOODS:
+        item_id = good["item_id"]
+        try:
+            quote = client.commodity_now(region, item_id)
+        except UndermineApiError:
+            continue
+
+        daily = fetch_daily_history(client, True, DEFAULT_REALM, region, item_id)
+        heatmap = compute_weekday_heatmap(daily)
+        flip = compute_tomorrow_flip(quote.price_copper, heatmap)
+        if not flip or flip["profit_pct"] < min_profit_pct:
+            continue
+
+        rows.append({
+            **good,
+            "wowhead_url": f"https://www.wowhead.com/item={item_id}",
+            "price_copper": quote.price_copper,
+            "quantity": quote.quantity,
+            **flip,
+        })
+
+    rows.sort(key=lambda r: r["profit_pct"], reverse=True)
+    return rows[:limit]
+
+
 # ── recipes (Wowhead "reagent for" scrape) ──────────────────────────────────────
 
 WOWHEAD_ITEM_URL = "https://www.wowhead.com/item={item_id}/x"

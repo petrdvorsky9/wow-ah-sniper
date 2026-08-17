@@ -25,10 +25,14 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from item_report import (
+    CATEGORY_LABELS,
     DEFAULT_REALM,
     DEFAULT_REGION,
+    MIN_FLIP_PROFIT_PCT,
+    QUALITY_META,
     WOWHEAD_ICON_URL,
     build_flask_overview,
+    build_flip_ribbon,
     detect_scope,
     fetch_wowhead_item_meta,
     fmt_gold,
@@ -77,6 +81,33 @@ def get_flask_overview_cached() -> list[dict]:
     except Exception:
         return _flask_overview_cache["rows"] or []
 
+
+# ── Midnight short-flip ribbon cache (avoids refetching on every landing-page hit) ─
+
+FLIP_RIBBON_TTL_SECONDS = 600
+_flip_ribbon_cache: dict = {"rows": None, "fetched_at": 0.0}
+
+
+def get_flip_ribbon_cached() -> list[dict]:
+    """Cached wrapper around `build_flip_ribbon` — refreshes at most once every
+    `FLIP_RIBBON_TTL_SECONDS`. On a refresh failure, keeps serving the last good
+    data rather than blanking out the landing page. Unlike the flask overview, an
+    empty list here is also a valid (cacheable) result — it means nothing in the
+    basket cleared the profit bar today, not that the fetch failed."""
+    now = time.monotonic()
+    if _flip_ribbon_cache["rows"] is not None and (
+        now - _flip_ribbon_cache["fetched_at"] < FLIP_RIBBON_TTL_SECONDS
+    ):
+        return _flip_ribbon_cache["rows"]
+    try:
+        client = UndermineClient()
+        rows = build_flip_ribbon(client, region="eu", limit=16)
+        _flip_ribbon_cache["rows"] = rows
+        _flip_ribbon_cache["fetched_at"] = now
+        return rows
+    except Exception:
+        return _flip_ribbon_cache["rows"] or []
+
 # ── shared dark theme (same palette as item_report.py's dashboard) ─────────────
 
 _PAGE_SHELL = """<!DOCTYPE html>
@@ -110,6 +141,13 @@ _PAGE_SHELL = """<!DOCTYPE html>
     color: var(--text);
     font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
+  .page-stack {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+  }
   .box {
     width: 100%;
     max-width: 480px;
@@ -119,6 +157,7 @@ _PAGE_SHELL = """<!DOCTYPE html>
     padding: 28px 28px 24px;
   }
   .box.box-wide { max-width: 620px; }
+  .box.box-flip { max-width: 1200px; }
   @media (max-width: 480px) {
     body { padding: 20px 12px; align-items: flex-start; }
     .box { padding: 20px 18px 18px; border-radius: 14px; }
@@ -164,6 +203,62 @@ _PAGE_SHELL = """<!DOCTYPE html>
     .flask-row { justify-content: space-between; }
     .flask-id { flex-basis: 100%; }
   }
+  .flip-ribbon-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .flip-ribbon-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  .flip-ribbon-sub { color: var(--muted); font-size: 11px; margin-bottom: 14px; }
+  .flip-ribbon-nav { display: flex; gap: 6px; flex-shrink: 0; }
+  .flip-nav-btn {
+    width: 26px; height: 26px; border-radius: 8px;
+    background: rgba(255,255,255,0.04); border: 1px solid var(--card-border); color: var(--text);
+    font-size: 14px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background .15s, border-color .15s, opacity .15s;
+  }
+  .flip-nav-btn:hover { background: rgba(240,192,64,0.12); border-color: var(--gold); color: var(--gold); }
+  .flip-nav-btn:disabled { opacity: .35; cursor: default; }
+  .flip-nav-btn:disabled:hover { background: rgba(255,255,255,0.04); border-color: var(--card-border); color: var(--text); }
+  .flip-viewport { position: relative; }
+  .flip-scroll {
+    display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; margin: 0 -4px;
+    scroll-snap-type: x mandatory; scroll-behavior: smooth;
+    scrollbar-width: none;
+  }
+  .flip-scroll::-webkit-scrollbar { display: none; }
+  .flip-card {
+    flex: 0 0 190px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin: 0 4px;
+    scroll-snap-align: start;
+  }
+  .flip-card-tags { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; flex-wrap: wrap; }
+  .flip-card-cat {
+    display: inline-block; font-size: 9px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; color: var(--muted); background: rgba(255,255,255,0.06);
+    border-radius: 5px; padding: 2px 6px;
+  }
+  .flip-card-quality { font-size: 9px; font-weight: 600; letter-spacing: .02em; }
+  .flip-card-rank { font-size: 9px; color: var(--muted); margin-bottom: 8px; }
+  .flip-card-id { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .flip-card-id img { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--card-border); flex-shrink: 0; }
+  .flip-card-name { font-size: 12px; line-height: 1.25; min-width: 0; }
+  .flip-card-name a { color: var(--text); text-decoration: none; border-bottom: 1px dotted var(--muted); }
+  .flip-card-name a:hover { color: var(--gold) !important; border-bottom-color: var(--gold); }
+  .flip-card-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .flip-card-row .v { color: var(--text); font-weight: 600; }
+  .flip-card-profit {
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--card-border);
+    font-size: 13px; font-weight: 700; color: var(--green);
+  }
+  .flip-card-profit-sub { font-size: 10px; font-weight: 400; color: var(--muted); margin-top: 1px; }
+  .flip-card-btn {
+    display: block; text-align: center; margin-top: 9px;
+    background: transparent; border: 1px solid var(--gold); color: var(--gold);
+    font-size: 10px; font-weight: 600; text-decoration: none; padding: 5px 0; border-radius: 7px;
+  }
+  .flip-card-btn:hover { background: var(--gold); color: #1a1305; }
+  .flip-empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
   h1 { margin: 0 0 6px; font-size: 22px; font-weight: 600; }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
   form { display: flex; flex-direction: column; gap: 12px; }
@@ -221,7 +316,7 @@ _PAGE_SHELL = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div class="box __BOX_CLASS__">
+<div class="page-stack">
 __BODY__
 </div>
 </body>
@@ -229,12 +324,11 @@ __BODY__
 """
 
 
-def _page(title: str, body: str, align: str = "center", box_class: str = "") -> str:
+def _page(title: str, body: str, align: str = "center") -> str:
     return (
         _PAGE_SHELL.replace("__TITLE__", html_escape(title))
         .replace("__BODY__", body)
         .replace("__ALIGN__", align)
-        .replace("__BOX_CLASS__", box_class)
     )
 
 
@@ -293,12 +387,130 @@ def render_flask_overview() -> str:
     )
 
 
+_FLIP_CAROUSEL_SCRIPT = """
+<script>
+(function () {
+  function flipEls() {
+    return {
+      scroll: document.getElementById('flip-scroll'),
+      prev: document.getElementById('flip-prev'),
+      next: document.getElementById('flip-next'),
+    };
+  }
+  window.flipScrollBy = function (dir) {
+    var scroll = flipEls().scroll;
+    if (!scroll) return;
+    var card = scroll.querySelector('.flip-card');
+    var step = card ? card.getBoundingClientRect().width + 18 : scroll.clientWidth * 0.8;
+    scroll.scrollBy({ left: step * dir, behavior: 'smooth' });
+  };
+  function updateNav() {
+    var els = flipEls();
+    if (!els.scroll || !els.prev || !els.next) return;
+    var max = els.scroll.scrollWidth - els.scroll.clientWidth - 1;
+    els.prev.disabled = els.scroll.scrollLeft <= 0;
+    els.next.disabled = els.scroll.scrollLeft >= max;
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    var scroll = flipEls().scroll;
+    if (!scroll) return;
+    scroll.addEventListener('scroll', updateNav, { passive: true });
+    window.addEventListener('resize', updateNav);
+    updateNav();
+  });
+})();
+</script>
+"""
+
+
+def render_flip_ribbon() -> str:
+    """Standalone landing-page box (own row, above the search box, wider than it):
+    top "buy now, sell tomorrow" picks across a basket of Midnight
+    materials/flasks/potions/phials, ranked by net profit after the 5% AH cut.
+    Returns "" if the cache hasn't fetched anything yet (e.g. very first request
+    while the initial fetch is in flight) — a genuinely empty *result* (no
+    profitable flips today) still renders the box with a friendly empty state."""
+    rows = get_flip_ribbon_cached()
+    if rows is None:
+        return ""
+
+    if not rows:
+        cards_html = (
+            '<div class="flip-empty">No short flips clear the '
+            f'{MIN_FLIP_PROFIT_PCT:.0f}% profit bar right now '
+            "&mdash; check back later today or tomorrow.</div>"
+        )
+    else:
+        cards = []
+        for r in rows:
+            icon_img = f'<img src="{WOWHEAD_ICON_URL.format(icon=r["icon"])}" alt="">' if r.get("icon") else ""
+            cat_label = CATEGORY_LABELS.get(r["category"], r["category"].title())
+            quality_label, quality_color = QUALITY_META.get(r.get("quality", 1), QUALITY_META[1])
+            rank_label = r.get("rank")
+            sign = "+" if r["profit_copper"] >= 0 else "-"
+            cards.append(
+                '<div class="flip-card">'
+                '<div class="flip-card-tags">'
+                f'<span class="flip-card-cat">{html_escape(cat_label)}</span>'
+                f'<span class="flip-card-quality" style="color:{quality_color}">'
+                f'&#9679; {html_escape(quality_label)}</span>'
+                "</div>"
+                + (f'<div class="flip-card-rank">&#9670; {html_escape(rank_label)}</div>' if rank_label else "")
+                + '<div class="flip-card-id">'
+                f"{icon_img}"
+                '<div class="flip-card-name">'
+                f'<a href="{r["wowhead_url"]}" target="_blank" rel="noopener noreferrer" '
+                f'style="color:{quality_color}">{html_escape(r["name"])}</a>'
+                "</div>"
+                "</div>"
+                f'<div class="flip-card-row"><span>Buy now</span><span class="v">{html_escape(fmt_gold(r["price_copper"]))}</span></div>'
+                f'<div class="flip-card-row"><span>Sell {html_escape(r["tomorrow_weekday"])}</span>'
+                f'<span class="v">{html_escape(fmt_gold(r["net_sell_copper"]))}</span></div>'
+                '<div class="flip-card-profit">'
+                f'{sign}{html_escape(fmt_gold(abs(r["profit_copper"])))}'
+                f'<div class="flip-card-profit-sub">{r["profit_pct"]:+.0f}% after 5% AH cut</div>'
+                "</div>"
+                f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
+                "</div>"
+            )
+        cards_html = (
+            '<div class="flip-viewport">'
+            '<div class="flip-scroll" id="flip-scroll">' + "".join(cards) + "</div>"
+            "</div>"
+        )
+
+    nav_html = (
+        '<div class="flip-ribbon-nav">'
+        '<button type="button" class="flip-nav-btn" id="flip-prev" aria-label="Previous" onclick="flipScrollBy(-1)">&lsaquo;</button>'
+        '<button type="button" class="flip-nav-btn" id="flip-next" aria-label="Next" onclick="flipScrollBy(1)">&rsaquo;</button>'
+        "</div>"
+        if rows else ""
+    )
+
+    return (
+        '<div class="box box-flip">'
+        '<div class="flip-ribbon-head">'
+        '<div><div class="flip-ribbon-title">Midnight Short Flips &middot; Buy Today, Sell Tomorrow &middot; EU</div>'
+        '<div class="flip-ribbon-sub">Ranked by net profit after the 5% AH cut, using each item\'s historical weekday price pattern. '
+        '&#9679; dot = item quality (white/green/blue/purple = Common/Uncommon/Rare/Epic). '
+        '&#9670; tag = crafting rank &mdash; raw materials show the cheaper Silver rank (Gold-rank listings of the same item cost more), '
+        'flasks/phials/potions show the max recipe rank. Every item here is Midnight-only, none are ported from Dragonflight.</div></div>'
+        f"{nav_html}"
+        "</div>"
+        f"{cards_html}"
+        "</div>"
+        + (_FLIP_CAROUSEL_SCRIPT if rows else "")
+    )
+
+
 def render_search_page(error: str | None = None, query: str = "") -> str:
     error_html = f'<div class="error">{html_escape(error)}</div>' if error else ""
     region_options = "".join(
         f'<option value="{r}">{r.upper()}</option>' for r in REGIONS
     )
     body = f"""
+{render_flip_ribbon()}
+<div class="box box-wide">
 <h1>WoW AH Sniper</h1>
 <div class="sub">Search any auction house item to see its live price dashboard.</div>
 {error_html}
@@ -333,15 +545,18 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
   being made!
 </div>
 {render_flask_overview()}
+</div>
 """
-    return _page("WoW AH Sniper", body, box_class="box-wide")
+    return _page("WoW AH Sniper", body)
 
 
 def render_error_page(message: str, query: str = "") -> str:
     body = f"""
+<div class="box">
 <h1>Couldn't load that item</h1>
 <div class="error">{html_escape(message)}</div>
 <a class="back" href="/{'?q=' + query if query else ''}">&larr; Back to search</a>
+</div>
 """
     return _page("WoW AH Sniper — Error", body)
 
