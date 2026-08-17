@@ -18,6 +18,10 @@ VALID_REGIONS = {"us", "eu", "tw", "kr"}
 class UndermineApiError(RuntimeError):
     """Raised when the Undermine Exchange API returns an error response."""
 
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 @dataclass
 class PriceQuote:
@@ -97,7 +101,8 @@ class UndermineClient:
         response = self._session.get(url, timeout=self.timeout)
         if response.status_code != 200:
             raise UndermineApiError(
-                f"Undermine API request failed ({response.status_code}) for {path}: {response.text}"
+                f"Undermine API request failed ({response.status_code}) for {path}: {response.text}",
+                status_code=response.status_code,
             )
         return response.json()
 

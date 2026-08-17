@@ -695,7 +695,13 @@ def build_flask_overview(client: UndermineClient, region: str = "eu") -> list[di
         }
         try:
             quote = client.commodity_now(region, item_id)
-        except UndermineApiError:
+        except UndermineApiError as exc:
+            if exc.status_code == 429:
+                # Propagate rate-limit errors instead of marking every remaining
+                # item "unavailable" — the caller's cache wrapper falls back to the
+                # last good result on a raised exception, which is far better than
+                # overwriting good cached data with an all-unavailable list.
+                raise
             rows.append(row)
             continue
 
@@ -977,7 +983,11 @@ def build_flip_ribbon(
         item_id = good["item_id"]
         try:
             quote = client.commodity_now(region, item_id)
-        except UndermineApiError:
+        except UndermineApiError as exc:
+            if exc.status_code == 429:
+                # See build_flask_overview: propagate so the cache wrapper keeps
+                # serving last-good rows instead of caching an empty result.
+                raise
             continue
 
         daily = fetch_daily_history(client, True, DEFAULT_REALM, region, item_id)
@@ -1169,7 +1179,11 @@ def build_hourly_flip_ribbon(
         try:
             quote = client.commodity_now(region, item_id)
             hourly = client.commodity_hourly(region, item_id)
-        except UndermineApiError:
+        except UndermineApiError as exc:
+            if exc.status_code == 429:
+                # See build_flask_overview: propagate so the cache wrapper keeps
+                # serving last-good rows instead of caching an empty result.
+                raise
             continue
 
         heatmap = compute_hourly_heatmap(hourly)
@@ -1549,13 +1563,19 @@ def _render_material_tooltip(row: dict) -> str:
     )
 
 
-def render_recipes_card(rows: list[dict] | None, item_name: str) -> str:
+def render_recipes_card(rows: list[dict] | None, item_name: str, requested: bool = True) -> str:
     """Render the whole "Recipes" card, or "" if the item isn't used in any known recipe.
 
-    - rows is None: Wowhead lookup failed -> show the card with an error note.
+    - requested is False: recipes weren't asked for at all -> omit the card entirely
+      (distinct from a failed lookup, so skipping recipes never shows a false
+      "unavailable" note).
+    - rows is None (requested True): Wowhead lookup failed -> show the card with an error note.
     - rows is []: lookup succeeded but the item is used in no recipes -> omit the card entirely.
     - rows has entries: show the card with the recipes table.
     """
+    if not requested:
+        return ""
+
     if not rows and rows is not None:
         return ""
 
@@ -2169,6 +2189,7 @@ def render_html_report(
     snapshots_all: list[PriceSnapshot],
     out_path: Path | None = None,
     recipe_rows: list[dict] | None = None,
+    recipes_requested: bool = True,
     baseline: dict | None = None,
     recommendation: dict | None = None,
     weekday_heatmap: dict | None = None,
@@ -2255,7 +2276,7 @@ def render_html_report(
         .replace("__AVG_QTY_14D__", f"{avg_qty_14d:,}")
         .replace("__GENERATED_AT__", now_utc.strftime("%Y-%m-%d %H:%M UTC"))
         .replace("__DATA_JSON__", json.dumps(data))
-        .replace("__RECIPES_CARD__", render_recipes_card(recipe_rows, item_name))
+        .replace("__RECIPES_CARD__", render_recipes_card(recipe_rows, item_name, requested=recipes_requested))
         .replace("__RECOMMENDATION_PILL__", render_recommendation_pill(baseline, recommendation))
         .replace("__WEEKDAY_HEATMAP__", render_weekday_heatmap_html(weekday_heatmap, current_price))
         .replace("__PREDICTION_TAB__", render_prediction_tab_html(prediction, current_price))
@@ -2512,7 +2533,7 @@ def generate_report(
     html = render_html_report(
         item_name, item_id, commodity, realm, region,
         quote.price_copper, quote.quantity, quote.last_updated,
-        hourly, html_path, recipe_rows=recipe_rows,
+        hourly, html_path, recipe_rows=recipe_rows, recipes_requested=include_recipes,
         baseline=baseline, recommendation=recommendation,
         weekday_heatmap=weekday_heatmap, prediction=prediction,
     )

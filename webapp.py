@@ -29,12 +29,10 @@ from item_report import (
     DEFAULT_REALM,
     DEFAULT_REGION,
     MIN_FLIP_PROFIT_PCT,
-    MIN_HOURLY_FLIP_PROFIT_PCT,
     QUALITY_META,
     WOWHEAD_ICON_URL,
     build_flask_overview,
     build_flip_ribbon,
-    build_hourly_flip_ribbon,
     detect_scope,
     fetch_wowhead_item_meta,
     fmt_gold,
@@ -58,6 +56,15 @@ limiter = Limiter(
 )
 
 REGIONS = ["eu", "us", "tw", "kr"]
+
+# Shown instead of the generic "isn't tracked" message when Undermine returns a 429 —
+# the shared API key has a fixed points/hour budget, and a burst of traffic (or the
+# landing-page ribbons refreshing) can exhaust it for everyone until it replenishes.
+_RATE_LIMITED_MESSAGE = (
+    "Undermine Exchange's API key is temporarily rate-limited (this app shares one key "
+    "across all visitors, and it has an hourly quota). This is not an error with your "
+    "item — please wait a few minutes and try again."
+)
 
 
 def _cache_age_label(fetched_at: float) -> str:
@@ -123,36 +130,6 @@ def get_flip_ribbon_cached() -> list[dict]:
         return rows
     except Exception:
         return _flip_ribbon_cache["rows"] or []
-
-
-# ── Midnight quick-flip ribbon cache (buy now, sell in ~1 hour) ────────────────
-
-# Shorter TTL than the daily ribbon: an "hour" pick goes stale much faster, so it's
-# worth refetching more often even though it costs one extra Undermine hourly call
-# per basket item on a cache miss.
-HOURLY_FLIP_RIBBON_TTL_SECONDS = 300
-_hourly_flip_ribbon_cache: dict = {"rows": None, "fetched_at": 0.0}
-
-
-def get_hourly_flip_ribbon_cached() -> list[dict]:
-    """Cached wrapper around `build_hourly_flip_ribbon` — refreshes at most once
-    every `HOURLY_FLIP_RIBBON_TTL_SECONDS`. On a refresh failure, keeps serving the
-    last good data rather than blanking out the landing page. An empty list is a
-    valid (cacheable) result — nothing in the basket cleared the profit bar this
-    hour, not that the fetch failed."""
-    now = time.monotonic()
-    if _hourly_flip_ribbon_cache["rows"] is not None and (
-        now - _hourly_flip_ribbon_cache["fetched_at"] < HOURLY_FLIP_RIBBON_TTL_SECONDS
-    ):
-        return _hourly_flip_ribbon_cache["rows"]
-    try:
-        client = UndermineClient()
-        rows = build_hourly_flip_ribbon(client, region="eu", limit=16)
-        _hourly_flip_ribbon_cache["rows"] = rows
-        _hourly_flip_ribbon_cache["fetched_at"] = now
-        return rows
-    except Exception:
-        return _hourly_flip_ribbon_cache["rows"] or []
 
 
 # ── shared dark theme (same palette as item_report.py's dashboard) ─────────────
@@ -332,7 +309,6 @@ _PAGE_SHELL = """<!DOCTYPE html>
   .adv-row > div { flex: 1; }
   label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
   select, .adv-row input[type=text] { width: 100%; padding: 8px 10px; font-size: 13px; }
-  .checkbox-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
   button {
     background: var(--gold);
     color: #1a1305;
@@ -409,7 +385,7 @@ def render_flask_overview() -> str:
             "</div>"
         )
         report_btn = (
-            f'<a class="flask-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
+            f'<a class="flask-btn" href="/report?q={r["item_id"]}&region=eu">Report</a>'
         )
 
         if not r["available"]:
@@ -528,7 +504,7 @@ def _render_flip_card(r: dict) -> str:
         f'{sign}{html_escape(fmt_gold(abs(r["profit_copper"])))}'
         f'<div class="flip-card-profit-sub">{r["profit_pct"]:+.0f}% after 5% AH cut</div>'
         "</div>"
-        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
+        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu">Report</a>'
         "</div>"
     )
 
@@ -635,30 +611,6 @@ def render_flip_ribbon() -> str:
     )
 
 
-def render_hourly_flip_ribbon() -> str:
-    """Standalone landing-page box: top "buy now, sell in about an hour" picks
-    across the same Midnight basket, ranked by net profit after the 5% AH cut,
-    using each item's detrended, outlier-robust hour-of-day price pattern (from
-    ~14 days of hourly snapshots) instead of the weekday one. Returns "" if the
-    cache hasn't fetched anything yet."""
-    rows = get_hourly_flip_ribbon_cached()
-    return _render_flip_ribbon_box(
-        rows,
-        ribbon_id="hourly",
-        title="Midnight Quick Flips &middot; Buy Now, Sell in ~1 Hour &middot; EU",
-        subtitle=(
-            "Ranked by net profit after the 5% AH cut, comparing the current price to each item's detrended, "
-            "outlier-robust historical price pattern for the upcoming hour (from ~14 days of hourly snapshots). "
-            "&#9679; dot = item quality (white/green/blue/purple = Common/Uncommon/Rare/Epic). "
-            "&#9670; tag = crafting quality tier (same meaning as the Midnight Flasks box below). "
-            "Hour-to-hour moves are naturally smaller than day-to-day ones, so treat these as tighter, faster turnarounds."
-        ),
-        empty_pct=MIN_HOURLY_FLIP_PROFIT_PCT,
-        empty_hint="check back again in a bit",
-        updated_label=_cache_age_label(_hourly_flip_ribbon_cache["fetched_at"]),
-    )
-
-
 def render_search_page(error: str | None = None, query: str = "") -> str:
     error_html = f'<div class="error">{html_escape(error)}</div>' if error else ""
     region_options = "".join(
@@ -666,7 +618,6 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
     )
     body = f"""
 {render_flip_ribbon()}
-{render_hourly_flip_ribbon()}
 <div class="box box-wide">
 <h1>WoW AH Sniper</h1>
 <div class="sub">Search any auction house item to see its live price dashboard.</div>
@@ -684,10 +635,6 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
         <label>Realm override (non-commodity items)</label>
         <input type="text" name="realm" placeholder="{DEFAULT_REALM}">
       </div>
-    </div>
-    <div class="checkbox-row" style="margin-top:10px;">
-      <input type="checkbox" id="recipes" name="recipes" value="1" checked>
-      <label for="recipes" style="margin:0;">Include recipes section (slower)</label>
     </div>
   </details>
   <button type="submit">Look up price</button>
@@ -750,7 +697,6 @@ def report():
     if region not in REGIONS:
         return render_error_page(f"Unsupported region '{region}'.", query), 400
     realm_override = (request.args.get("realm") or "").strip() or None
-    include_recipes = request.args.get("recipes", "1") != "0"
 
     try:
         item_id = resolve_item_query(query)
@@ -764,7 +710,9 @@ def report():
 
     try:
         commodity, realm, quote, hourly = detect_scope(client, region, item_id, realm_override)
-    except UndermineApiError:
+    except UndermineApiError as exc:
+        if exc.status_code == 429:
+            return render_error_page(_RATE_LIMITED_MESSAGE, query), 429
         realm_desc = realm_override or DEFAULT_REALM
         return (
             render_error_page(
@@ -781,10 +729,12 @@ def report():
     try:
         result = generate_report(
             item_id, item_name, commodity, realm, region,
-            include_recipes=include_recipes,
+            include_recipes=False,
             client=client, quote=quote, hourly=hourly,
         )
     except UndermineApiError as exc:
+        if exc.status_code == 429:
+            return render_error_page(_RATE_LIMITED_MESSAGE, query), 429
         return render_error_page(str(exc), query), 500
 
     return Response(result["html"], mimetype="text/html")
