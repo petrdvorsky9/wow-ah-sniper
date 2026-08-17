@@ -59,6 +59,20 @@ limiter = Limiter(
 
 REGIONS = ["eu", "us", "tw", "kr"]
 
+
+def _cache_age_label(fetched_at: float) -> str:
+    """Minutes since this box's data was last successfully (re)fetched from
+    Undermine. Deliberately worded "checked", not "updated", to avoid implying
+    this is the same thing as the item report page's "updated Xm ago" — that one
+    is Undermine's own per-item last-price-change timestamp (`PriceQuote.last_updated`),
+    which can be much older than this even right after a successful refetch, since
+    re-polling doesn't make Undermine's underlying snapshot any newer. A box here
+    covering ~20 items also has no single well-defined "last updated" moment the
+    way one report page (one item) does."""
+    mins = int((time.monotonic() - fetched_at) // 60)
+    return f"checked {mins}m ago" if mins > 0 else "checked just now"
+
+
 # ── Midnight flask overview cache (avoids refetching on every landing-page hit) ─
 
 FLASK_OVERVIEW_TTL_SECONDS = 600
@@ -197,7 +211,9 @@ _PAGE_SHELL = """<!DOCTYPE html>
     .adv-row { flex-direction: column; gap: 12px; }
   }
   .flask-overview { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--card-border); }
-  .flask-overview-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 12px; }
+  .flask-overview-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  .flask-overview-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .flask-overview-updated { color: var(--muted); font-size: 10px; flex-shrink: 0; }
   .flask-row {
     display: flex; align-items: center; gap: 10px; padding: 9px 0;
     border-bottom: 1px solid var(--card-border); flex-wrap: wrap;
@@ -238,6 +254,7 @@ _PAGE_SHELL = """<!DOCTYPE html>
   }
   .flip-ribbon-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .flip-ribbon-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .flip-ribbon-updated { color: var(--muted); font-size: 10px; margin-top: 3px; }
   .flip-ribbon-body { margin-top: 12px; }
   .box-flip.flip-collapsed .flip-ribbon-body { display: none; }
   .flip-ribbon-sub { color: var(--muted); font-size: 11px; margin-bottom: 14px; }
@@ -377,6 +394,7 @@ def render_flask_overview() -> str:
     rows = get_flask_overview_cached()
     if not rows:
         return ""
+    updated_label = _cache_age_label(_flask_overview_cache["fetched_at"])
 
     row_html = []
     for r in rows:
@@ -391,7 +409,7 @@ def render_flask_overview() -> str:
             "</div>"
         )
         report_btn = (
-            f'<a class="flask-btn" href="/report?q={r["item_id"]}&region=eu&recipes=1">Report</a>'
+            f'<a class="flask-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
         )
 
         if not r["available"]:
@@ -419,7 +437,10 @@ def render_flask_overview() -> str:
 
     return (
         '<div class="flask-overview">'
+        '<div class="flask-overview-head">'
         '<div class="flask-overview-title">Midnight Flasks &middot; EU &middot; higher quality</div>'
+        f'<div class="flask-overview-updated">{updated_label}</div>'
+        "</div>"
         f'{"".join(row_html)}'
         "</div>"
     )
@@ -507,7 +528,7 @@ def _render_flip_card(r: dict) -> str:
         f'{sign}{html_escape(fmt_gold(abs(r["profit_copper"])))}'
         f'<div class="flip-card-profit-sub">{r["profit_pct"]:+.0f}% after 5% AH cut</div>'
         "</div>"
-        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=1">Report</a>'
+        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
         "</div>"
     )
 
@@ -520,6 +541,7 @@ def _render_flip_ribbon_box(
     subtitle: str,
     empty_pct: float,
     empty_hint: str,
+    updated_label: str,
 ) -> str:
     """Shared renderer for both flip ribbons (buy-tomorrow and buy-in-an-hour) —
     same card layout, carousel behavior, and collapse/expand behavior, just
@@ -573,7 +595,10 @@ def _render_flip_ribbon_box(
     return (
         f'<div class="box box-flip{"" if expanded else " flip-collapsed"}" data-ribbon-box="{ribbon_id}">'
         '<div class="flip-ribbon-head">'
+        '<div>'
         f'<div class="flip-ribbon-title">{title}</div>'
+        f'<div class="flip-ribbon-updated">{updated_label}</div>'
+        "</div>"
         f'<div class="flip-ribbon-controls">{nav_html}{toggle_btn}</div>'
         "</div>"
         f"{empty_note_html}"
@@ -592,8 +617,9 @@ def render_flip_ribbon() -> str:
     Returns "" if the cache hasn't fetched anything yet (e.g. very first request
     while the initial fetch is in flight) — a genuinely empty *result* (no
     profitable flips today) still renders the box with a friendly empty state."""
+    rows = get_flip_ribbon_cached()
     return _render_flip_ribbon_box(
-        get_flip_ribbon_cached(),
+        rows,
         ribbon_id="daily",
         title="Midnight Short Flips &middot; Buy Today, Sell Tomorrow &middot; EU",
         subtitle=(
@@ -605,6 +631,7 @@ def render_flip_ribbon() -> str:
         ),
         empty_pct=MIN_FLIP_PROFIT_PCT,
         empty_hint="check back later today or tomorrow",
+        updated_label=_cache_age_label(_flip_ribbon_cache["fetched_at"]),
     )
 
 
@@ -614,8 +641,9 @@ def render_hourly_flip_ribbon() -> str:
     using each item's detrended, outlier-robust hour-of-day price pattern (from
     ~14 days of hourly snapshots) instead of the weekday one. Returns "" if the
     cache hasn't fetched anything yet."""
+    rows = get_hourly_flip_ribbon_cached()
     return _render_flip_ribbon_box(
-        get_hourly_flip_ribbon_cached(),
+        rows,
         ribbon_id="hourly",
         title="Midnight Quick Flips &middot; Buy Now, Sell in ~1 Hour &middot; EU",
         subtitle=(
@@ -627,6 +655,7 @@ def render_hourly_flip_ribbon() -> str:
         ),
         empty_pct=MIN_HOURLY_FLIP_PROFIT_PCT,
         empty_hint="check back again in a bit",
+        updated_label=_cache_age_label(_hourly_flip_ribbon_cache["fetched_at"]),
     )
 
 
