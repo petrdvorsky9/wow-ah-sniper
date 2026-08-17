@@ -221,15 +221,49 @@ def compute_recommendation(
     }
 
 
+# Flag an item's flip numbers as unreliable when its current actual price has
+# drifted this far (%) from the window's fitted trend line — a sign of a recent
+# shock (crash/spike) the historical pattern hasn't absorbed yet, e.g. a 30-day-old
+# weekday average is meaningless the day after a 50% crash.
+MAX_TREND_DEVIATION_PCT = 20.0
+
+
+def is_price_off_trend(
+    current_price_copper: int | None, trend_price_copper: int | None,
+    max_deviation_pct: float = MAX_TREND_DEVIATION_PCT,
+) -> bool:
+    """True if `current_price_copper` has diverged from the fitted trend line by
+    more than `max_deviation_pct` — i.e. the item just had a sharp price move the
+    historical weekday/hourly pattern doesn't reflect yet, so a "buy now, sell
+    later" call built from that pattern isn't trustworthy right now."""
+    if not current_price_copper or current_price_copper <= 0 or not trend_price_copper:
+        return False
+    deviation_pct = abs(current_price_copper - trend_price_copper) / trend_price_copper * 100
+    return deviation_pct > max_deviation_pct
+
+
 def compute_weekday_heatmap(
     daily: list[DailySnapshot] | None, window_days: int = BASELINE_WINDOW_DAYS,
 ) -> dict | None:
     """Buy/sell strength and supply level by weekday, over the last `window_days`
-    of daily history. For each weekday, compares that weekday's average price/qty
-    to the window's overall average: cheaper-than-average days are buy-strong,
-    pricier days are sell-strong; supply is reported the same way (below/above
-    average AH quantity) without buy/sell framing. Returns None if there's too
-    little history to fill out a meaningful weekly pattern."""
+    of daily history.
+
+    Detrended: rather than comparing each weekday's raw average price to the
+    window's raw overall average (which would mistake a multi-day price crash or
+    spike for a weekday-specific pattern — e.g. "Tuesdays are cheap" really just
+    meaning "the item crashed this week and happened to have more Tuesday
+    samples"), this fits a linear trend across the window (same method as
+    `compute_price_prediction`) and looks at each weekday's *median* deviation
+    from that trend line (median, not mean, so 1-2 outlier days can't dominate a
+    weekday that's otherwise flat). `avg_price_copper` is then that deviation
+    projected onto today's trend level, so it stays a meaningful "what this
+    weekday usually looks like right now" absolute price — cheaper-than-trend
+    days are buy-strong, pricier days are sell-strong. Supply is reported the
+    same way (below/above average AH quantity) without buy/sell framing, and
+    isn't detrended (quantity doesn't compound the way price does).
+
+    Returns None if there's too little history to fill out a meaningful weekly
+    pattern."""
     if not daily:
         return None
 
@@ -237,40 +271,51 @@ def compute_weekday_heatmap(
     if len(window) < 7:
         return None
 
-    by_weekday_price: dict[str, list[int]] = defaultdict(list)
+    n = len(window)
+    xs = list(range(n))
+    ys = [float(d.price_copper) for d in window]
+    dates = [datetime.strptime(d.day, "%Y-%m-%d") for d in window]
+    slope, intercept = _linear_regression(xs, ys)
+    trend_last = max(0.0, slope * (n - 1) + intercept)
+
+    by_weekday_resid: dict[str, list[float]] = defaultdict(list)
     by_weekday_qty: dict[str, list[int]] = defaultdict(list)
-    for d in window:
-        wd = datetime.strptime(d.day, "%Y-%m-%d").strftime("%a")
-        by_weekday_price[wd].append(d.price_copper)
+    for x, y, dt, d in zip(xs, ys, dates, window):
+        wd = dt.strftime("%a")
+        by_weekday_resid[wd].append(y - (slope * x + intercept))
         by_weekday_qty[wd].append(d.quantity)
 
-    overall_avg_price = sum(d.price_copper for d in window) / len(window)
     overall_avg_qty = sum(d.quantity for d in window) / len(window)
 
     days = []
     for wd in WEEKDAY_ORDER:
-        prices = by_weekday_price.get(wd) or []
+        resids = by_weekday_resid.get(wd) or []
         qtys = by_weekday_qty.get(wd) or []
-        if not prices:
+        if not resids:
             days.append({
                 "weekday": wd, "samples": 0,
                 "avg_price_copper": None, "price_pct": None,
                 "avg_qty": None, "qty_pct": None,
             })
             continue
-        avg_price = sum(prices) / len(prices)
+        avg_price = max(0.0, trend_last + _median(resids))
         avg_qty = sum(qtys) / len(qtys) if qtys else 0
         days.append({
             "weekday": wd,
-            "samples": len(prices),
-            "avg_price_copper": int(avg_price),
-            "price_pct": (avg_price - overall_avg_price) / overall_avg_price * 100,
+            "samples": len(resids),
+            "avg_price_copper": int(round(avg_price)),
+            "price_pct": (avg_price - trend_last) / trend_last * 100 if trend_last else 0.0,
             "avg_qty": int(avg_qty),
             "qty_pct": (avg_qty - overall_avg_qty) / overall_avg_qty * 100 if overall_avg_qty else 0.0,
         })
 
     avg_samples = sum(d["samples"] for d in days) / len(days)
-    return {"window_days": len(window), "avg_samples": avg_samples, "days": days}
+    return {
+        "window_days": len(window),
+        "avg_samples": avg_samples,
+        "days": days,
+        "trend_price_copper": int(round(trend_last)),
+    }
 
 
 def _heatmap_price_color(pct: float | None, cap: float = 25.0) -> str:
@@ -385,6 +430,17 @@ def _linear_regression(xs: list[float], ys: list[float]) -> tuple[float, float]:
     return slope, intercept
 
 
+def _median(values: list[float]) -> float:
+    """Median of `values` — used instead of a plain mean when aggregating
+    per-weekday/per-hour residuals, since a mean lets 1-2 outlier days (e.g. a
+    short-lived price spike) dominate an otherwise-flat pattern; a median is far
+    more robust to that."""
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2
+
+
 def _stdev(values: list[float]) -> float:
     n = len(values)
     if n < 2:
@@ -496,7 +552,27 @@ _PREDICTION_CONFIDENCE_COLOR = {
 }
 
 
-def render_prediction_tab_html(prediction: dict | None) -> str:
+def _forecast_vs_current_html(predicted_copper: int, current_price_copper: int | None) -> str:
+    """Small badge for the Day-by-Day Forecast table: is this forecasted day's price
+    higher, lower, or about the same (within PREDICTION_FLAT_THRESHOLD_PCT) as the
+    current price?"""
+    if not current_price_copper or current_price_copper <= 0:
+        return '<span style="color:var(--muted);">&mdash;</span>'
+
+    pct = (predicted_copper - current_price_copper) / current_price_copper * 100
+    if pct >= PREDICTION_FLAT_THRESHOLD_PCT:
+        arrow, label, color = "&#9650;", "Higher", "var(--green)"
+    elif pct <= -PREDICTION_FLAT_THRESHOLD_PCT:
+        arrow, label, color = "&#9660;", "Lower", "var(--pink)"
+    else:
+        arrow, label, color = "&#8594;", "Same", "var(--muted)"
+    return (
+        f'<span style="color:{color};font-weight:600;">{arrow} {label}</span> '
+        f'<span style="color:var(--muted);">({pct:+.1f}%)</span>'
+    )
+
+
+def render_prediction_tab_html(prediction: dict | None, current_price_copper: int | None = None) -> str:
     """Render the full contents of the Prediction tab: summary pills, a forecast
     chart (built client-side from `DATA.prediction`), and a day-by-day table — or
     a fallback message if there isn't enough daily history yet."""
@@ -539,11 +615,12 @@ def render_prediction_tab_html(prediction: dict | None) -> str:
             f'<td class="price-cell">{html_escape(fmt_gold(f["price_copper"]))}</td>'
             f'<td class="muted-cell">{html_escape(fmt_gold(f["low_copper"]))} &ndash; '
             f'{html_escape(fmt_gold(f["high_copper"]))}</td>'
+            f'<td>{_forecast_vs_current_html(f["price_copper"], current_price_copper)}</td>'
             "</tr>"
         )
     table = (
         '<table class="recipes-table">'
-        "<thead><tr><th>Date</th><th>Predicted Price</th><th>Range</th></tr></thead>"
+        "<thead><tr><th>Date</th><th>Predicted Price</th><th>Range</th><th>vs Current</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
@@ -662,131 +739,135 @@ def build_flask_overview(client: UndermineClient, region: str = "eu") -> list[di
 # tier for each of those professions.
 #
 # `rank`: every raw-gathering reagent (herb/leather/ore/crystal/gem) in Midnight
-# exists as TWO separate item ids sharing one name — a cheaper "Silver" rank and a
-# pricier "Gold" rank (confirmed per-item against live Undermine/Wowhead data; e.g.
-# Void-Tempered Leather is 238511 Silver / 238512 Gold). We deliberately pick the
-# Silver id everywhere — it's the highest-volume, most-traded rank — so the ribbon
-# is comparing like-for-like, not accidentally quoting a rarer Gold-rank listing.
-# A few reagents (Tranquility Bloom, Dazzling Thorium) only have one rank at all.
-# Crafted consumables (flasks/phials/potions) work differently: they're a single
-# item id whose ilvl/power comes from the alchemist's recipe rank, so we pick the
-# max (highest ilvl) recipe rank instead, since that's the version most buyers want.
+# exists as TWO separate item ids sharing one name — a cheaper "lower quality" tier and
+# a pricier "higher quality" tier (same terminology as the "Midnight Flasks · EU · higher
+# quality" box above). This was verified by pulling every item id that shares each name
+# from Wowhead's own search index (not just guessing nearby ids) and comparing live
+# Undermine prices for each pair, e.g. Void-Tempered Leather is 238511 (lower) / 238512
+# (higher), Tranquility Bloom is 236761 (lower) / 236767 (higher). We deliberately pick
+# the lower-quality id everywhere — it's the highest-volume, most-traded tier — so the
+# ribbon is comparing like-for-like, not accidentally quoting a rarer higher-quality
+# listing. Dazzling Thorium is the one reagent here confirmed to only have a single
+# item id/quality. Crafted consumables (flasks/phials/potions) work differently: they're
+# a single item id whose ilvl/power comes from the alchemist's recipe rank, so we pick
+# the higher-quality (highest ilvl) recipe rank instead, since that's the version most
+# buyers want — same pick as MIDNIGHT_FLASKS above.
 MIDNIGHT_TRADE_GOODS = [
     # Flasks
     {
         "item_id": 241320, "name": "Flask of Thalassian Resistance", "category": "flask",
-        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_yellow", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_yellow", "quality": 1, "rank": "Higher quality",
     },
     {
         "item_id": 241322, "name": "Flask of the Magisters", "category": "flask",
-        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_black", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_black", "quality": 1, "rank": "Higher quality",
     },
     {
         "item_id": 241324, "name": "Flask of the Blood Knights", "category": "flask",
-        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_white-", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_white-", "quality": 1, "rank": "Higher quality",
     },
     {
         "item_id": 241326, "name": "Flask of the Shattered Sun", "category": "flask",
-        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_red--", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_sindoreipotion_red--", "quality": 1, "rank": "Higher quality",
     },
     # Phials (profession-stat consumables)
     {
         "item_id": 241310, "name": "Haranir Phial of Finesse", "category": "phial",
-        "icon": "inv_12_profession_alchemy_flask_haranirpotion_blue", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_haranirpotion_blue", "quality": 1, "rank": "Higher quality",
     },
     {
         "item_id": 241314, "name": "Haranir Phial of Concentrated Ingenuity", "category": "phial",
-        "icon": "inv_12_profession_alchemy_flask_haranirpotion_orange", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_haranirpotion_orange", "quality": 1, "rank": "Higher quality",
     },
     {
         "item_id": 241316, "name": "Haranir Phial of Perception", "category": "phial",
-        "icon": "inv_12_profession_alchemy_flask_haranirpotion_purple", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_flask_haranirpotion_purple", "quality": 1, "rank": "Higher quality",
     },
     # Potions
     {
         "item_id": 241304, "name": "Silvermoon Health Potion", "category": "potion",
-        "icon": "inv_12_profession_alchemy_lightpotion_orange", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_12_profession_alchemy_lightpotion_orange", "quality": 1, "rank": "Higher quality",
     },
     {
         "item_id": 241306, "name": "Refreshing Serum", "category": "potion",
-        "icon": "inv_alchemy_80_potion01purple", "quality": 1, "rank": "Max rank (ilvl 295)",
+        "icon": "inv_alchemy_80_potion01purple", "quality": 1, "rank": "Higher quality",
     },
     # Materials (base Midnight herbs)
     {
         "item_id": 236761, "name": "Tranquility Bloom", "category": "material",
-        "icon": "inv_misc_herb_peacebloom", "quality": 1, "rank": "Only rank",
+        "icon": "inv_misc_herb_peacebloom", "quality": 1, "rank": "Lower quality",
     },
     {
         "item_id": 236774, "name": "Azeroot", "category": "material",
-        "icon": "inv_herb_earthroot", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_herb_earthroot", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 236776, "name": "Argentleaf", "category": "material",
-        "icon": "inv_misc_herb_silverleaf", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_misc_herb_silverleaf", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 236778, "name": "Mana Lily", "category": "material",
-        "icon": "inv_misc_herb_mageroyal", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_misc_herb_mageroyal", "quality": 2, "rank": "Lower quality",
     },
     {
-        "item_id": 236771, "name": "Sanguithorn", "category": "material",
-        "icon": "inv_herb_bloodthistle", "quality": 2, "rank": "Silver rank",
+        "item_id": 236770, "name": "Sanguithorn", "category": "material",
+        "icon": "inv_herb_bloodthistle", "quality": 2, "rank": "Lower quality",
     },
     # Leather/scales (base Midnight skinning materials)
     {
         "item_id": 238511, "name": "Void-Tempered Leather", "category": "leather",
-        "icon": "inv_12_profession_skinning_thalassianleather_brown", "quality": 1, "rank": "Silver rank",
+        "icon": "inv_12_profession_skinning_thalassianleather_brown", "quality": 1, "rank": "Lower quality",
     },
     {
         "item_id": 238513, "name": "Void-Tempered Scales", "category": "leather",
-        "icon": "inv_12_profession_skinning_thalassianscale_violet", "quality": 1, "rank": "Silver rank",
+        "icon": "inv_12_profession_skinning_thalassianscale_violet", "quality": 1, "rank": "Lower quality",
     },
     # Ores (base Midnight mining materials)
     {
         "item_id": 237359, "name": "Refulgent Copper Ore", "category": "ore",
-        "icon": "inv_ore_refulgentcopper", "quality": 1, "rank": "Silver rank",
+        "icon": "inv_ore_refulgentcopper", "quality": 1, "rank": "Lower quality",
     },
     {
         "item_id": 237362, "name": "Umbral Tin Ore", "category": "ore",
-        "icon": "inv_ore_umbraltin", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_ore_umbraltin", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 237364, "name": "Brilliant Silver Ore", "category": "ore",
-        "icon": "inv_ore_brilliantsilver", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_ore_brilliantsilver", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 237366, "name": "Dazzling Thorium", "category": "ore",
-        "icon": "inv_12_profession_mining_dazzlingthorium-", "quality": 3, "rank": "Only rank",
+        "icon": "inv_12_profession_mining_dazzlingthorium-", "quality": 3, "rank": "Only quality",
     },
     # Enchanting crystals/shards/dust (disenchanting byproducts)
     {
         "item_id": 243599, "name": "Eversinging Dust", "category": "crystal",
-        "icon": "inv_12_profession_enchanting_enchantingdust_green", "quality": 1, "rank": "Silver rank",
+        "icon": "inv_12_profession_enchanting_enchantingdust_green", "quality": 1, "rank": "Lower quality",
     },
     {
         "item_id": 243602, "name": "Radiant Shard", "category": "crystal",
-        "icon": "inv_12_profession_enchanting_enchantingshard_blue", "quality": 3, "rank": "Silver rank",
+        "icon": "inv_12_profession_enchanting_enchantingshard_blue", "quality": 3, "rank": "Lower quality",
     },
     {
         "item_id": 243605, "name": "Dawn Crystal", "category": "crystal",
-        "icon": "inv_12_profession_enchanting_enchantingcrystal_orange", "quality": 4, "rank": "Silver rank",
+        "icon": "inv_12_profession_enchanting_enchantingcrystal_orange", "quality": 4, "rank": "Lower quality",
     },
     # Gems (uncut Jewelcrafting prospecting output)
     {
         "item_id": 242553, "name": "Sanguine Garnet", "category": "gem",
-        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_red", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_red", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 242554, "name": "Amani Lapis", "category": "gem",
-        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_blue", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_blue", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 242607, "name": "Harandar Peridot", "category": "gem",
-        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_green", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_green", "quality": 2, "rank": "Lower quality",
     },
     {
         "item_id": 242606, "name": "Tenebrous Amethyst", "category": "gem",
-        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_purple", "quality": 2, "rank": "Silver rank",
+        "icon": "inv_12_profession_jewelcrafting_uncommon_gem_uncut_purple", "quality": 2, "rank": "Lower quality",
     },
 ]
 
@@ -865,8 +946,11 @@ def build_flip_ribbon(
     Best-effort per item: one Undermine doesn't track yet, or with too little daily
     history to know tomorrow's weekday pattern, is silently skipped rather than
     failing the whole ribbon. Items below `min_profit_pct` net profit are excluded
-    outright (not worth the overnight price risk), so the result can be shorter
-    than `limit` — or empty, if nothing clears the bar today.
+    outright (not worth the overnight price risk), as are items whose current
+    price has diverged too far from the fitted trend line (see
+    `is_price_off_trend` — a sign of a recent shock the weekday pattern doesn't
+    reflect yet), so the result can be shorter than `limit` — or empty, if
+    nothing clears the bar today.
     """
     rows = []
     for good in MIDNIGHT_TRADE_GOODS:
@@ -878,6 +962,11 @@ def build_flip_ribbon(
 
         daily = fetch_daily_history(client, True, DEFAULT_REALM, region, item_id)
         heatmap = compute_weekday_heatmap(daily)
+        if not heatmap or is_price_off_trend(
+            quote.price_copper, heatmap.get("trend_price_copper")
+        ):
+            continue
+
         flip = compute_tomorrow_flip(quote.price_copper, heatmap)
         if not flip or flip["profit_pct"] < min_profit_pct:
             continue
@@ -887,6 +976,198 @@ def build_flip_ribbon(
             "wowhead_url": f"https://www.wowhead.com/item={item_id}",
             "price_copper": quote.price_copper,
             "quantity": quote.quantity,
+            "sell_label": f"Sell {flip['tomorrow_weekday']}",
+            **flip,
+        })
+
+    rows.sort(key=lambda r: r["profit_pct"], reverse=True)
+    return rows[:limit]
+
+
+# ── Midnight quick-flip ribbon (buy now, sell in ~1 hour) ───────────────────────
+
+# Below this net profit (after the AH cut), a buy-now/sell-in-an-hour flip isn't
+# worth the churn — hour-to-hour price swings are naturally smaller than
+# day-to-day ones, so this bar is set lower than MIN_FLIP_PROFIT_PCT.
+MIN_HOURLY_FLIP_PROFIT_PCT = 1.0
+
+# A genuine hour-to-hour AH price move is small; a computed "profit" bigger than
+# this is far more likely a couple of outlier days skewing one hour's median than
+# a real, repeatable edge, so it's excluded rather than shown.
+MAX_HOURLY_FLIP_PROFIT_PCT = 12.0
+
+# Require at least this many same-hour samples (out of up to 14, one per day in the
+# ~14-day hourly history window) before trusting that hour's pattern — otherwise a
+# single unusual data point could masquerade as a reliable one.
+MIN_HOURLY_SAMPLES = 5
+
+# How many days of hourly snapshots to build the hour-of-day pattern from — matches
+# the ~14-day window the free Undermine hourly endpoint actually provides.
+HOURLY_WINDOW_DAYS = 14
+
+
+def compute_hourly_heatmap(
+    hourly: list[PriceSnapshot] | None, window_days: int = HOURLY_WINDOW_DAYS,
+) -> dict | None:
+    """Buy/sell strength by hour-of-day (UTC), over the last `window_days` of hourly
+    history — same idea as `compute_weekday_heatmap` but at hourly granularity, to
+    support "buy now, sell in about an hour" calls.
+
+    Detrended the same way: fits a linear trend across the whole hourly series and
+    looks at each hour-of-day's *median* deviation from that trend line (median,
+    not mean — this matters even more here than for the weekday heatmap, since a
+    commodity that spikes mid-window and settles back down would otherwise leave
+    "hour 12" looking like a huge buy/sell opportunity purely because a couple of
+    samples from the spike days happened to land in that bucket, not because of
+    any real, repeatable intraday pattern).
+
+    Returns None if there's too little history to fill out a meaningful pattern."""
+    if not hourly:
+        return None
+
+    window = sorted(
+        (s for s in last_n_days(hourly, window_days) if s.price_copper > 0),
+        key=lambda s: s.snapshot,
+    )
+    if len(window) < 24:
+        return None
+
+    n = len(window)
+    xs = list(range(n))
+    ys = [float(s.price_copper) for s in window]
+    hours_of_day = [parse_dt(s.snapshot).hour for s in window]
+    slope, intercept = _linear_regression(xs, ys)
+    trend_last = max(0.0, slope * (n - 1) + intercept)
+
+    by_hour_resid: dict[int, list[float]] = defaultdict(list)
+    for x, y, hr in zip(xs, ys, hours_of_day):
+        by_hour_resid[hr].append(y - (slope * x + intercept))
+
+    hours = []
+    for hr in range(24):
+        resids = by_hour_resid.get(hr) or []
+        if not resids:
+            hours.append({
+                "hour": hr, "samples": 0, "median_resid_copper": None,
+                "avg_price_copper": None, "price_pct": None,
+            })
+            continue
+        median_resid = _median(resids)
+        avg_price = max(0.0, trend_last + median_resid)
+        hours.append({
+            "hour": hr,
+            "samples": len(resids),
+            "median_resid_copper": median_resid,
+            "avg_price_copper": int(round(avg_price)),
+            "price_pct": (avg_price - trend_last) / trend_last * 100 if trend_last else 0.0,
+        })
+
+    avg_samples = sum(h["samples"] for h in hours) / len(hours)
+    return {
+        "window_days": window_days,
+        "avg_samples": avg_samples,
+        "hours": hours,
+        "trend_price_copper": int(round(trend_last)),
+    }
+
+
+def compute_next_hour_flip(
+    current_price_copper: int | None,
+    heatmap: dict | None,
+    sale_cut_pct: float = AH_SALE_CUT_PCT,
+    min_samples: int = MIN_HOURLY_SAMPLES,
+    max_profit_pct: float = MAX_HOURLY_FLIP_PROFIT_PCT,
+) -> dict | None:
+    """"Buy now, sell in about an hour" call for one item: projects the next UTC
+    hour's price by shifting the *current actual price* by the typical (median)
+    difference between this hour's and the next hour's residual-from-trend, net
+    of the AH's sale_cut_pct cut.
+
+    Anchoring on the current actual price (not the trend line's absolute level)
+    means only the *relative* hour-to-hour shape of the pattern is used — a trend
+    fit skewed by a mid-window spike can still distort that shape, so a result is
+    also discarded outright if it implies a profit bigger than `max_profit_pct`
+    (see MAX_HOURLY_FLIP_PROFIT_PCT) or too few historical samples for either
+    hour."""
+    if not current_price_copper or current_price_copper <= 0 or not heatmap:
+        return None
+
+    now = datetime.now(timezone.utc)
+    current_hour = now.hour
+    next_hour = (now + timedelta(hours=1)).hour
+    cur_cell = next(
+        (h for h in heatmap["hours"] if h["hour"] == current_hour and h["samples"] >= min_samples), None,
+    )
+    next_cell = next(
+        (h for h in heatmap["hours"] if h["hour"] == next_hour and h["samples"] >= min_samples), None,
+    )
+    if (
+        not cur_cell or not next_cell
+        or cur_cell["median_resid_copper"] is None or next_cell["median_resid_copper"] is None
+    ):
+        return None
+
+    next_hour_avg_copper = max(
+        0.0, current_price_copper + (next_cell["median_resid_copper"] - cur_cell["median_resid_copper"])
+    )
+    net_sell_copper = next_hour_avg_copper * (1 - sale_cut_pct)
+    profit_copper = int(round(net_sell_copper - current_price_copper))
+    profit_pct = profit_copper / current_price_copper * 100
+    if abs(profit_pct) > max_profit_pct:
+        return None
+
+    return {
+        "next_hour": next_hour,
+        "next_hour_avg_copper": int(round(next_hour_avg_copper)),
+        "net_sell_copper": int(round(net_sell_copper)),
+        "profit_copper": profit_copper,
+        "profit_pct": profit_pct,
+        "samples": min(cur_cell["samples"], next_cell["samples"]),
+    }
+
+
+def build_hourly_flip_ribbon(
+    client: UndermineClient,
+    region: str = "eu",
+    limit: int = 8,
+    min_profit_pct: float = MIN_HOURLY_FLIP_PROFIT_PCT,
+) -> list[dict]:
+    """Rank `MIDNIGHT_TRADE_GOODS` by "buy now, sell in about an hour" net profit
+    (after the AH's sale cut) and return the top `limit` still-profitable picks,
+    for the webapp landing page's quick-flip ribbon. Same approach as
+    `build_flip_ribbon`, but comparing the current price against a (detrended)
+    hour-of-day heatmap instead of a weekday one.
+
+    Best-effort per item: one Undermine doesn't track yet, or with too little
+    hourly history to know the next hour's pattern, is silently skipped, as are
+    items whose current price has diverged too far from the fitted trend line
+    (see `is_price_off_trend`) — same off-trend guard as the daily ribbon.
+    """
+    rows = []
+    for good in MIDNIGHT_TRADE_GOODS:
+        item_id = good["item_id"]
+        try:
+            quote = client.commodity_now(region, item_id)
+            hourly = client.commodity_hourly(region, item_id)
+        except UndermineApiError:
+            continue
+
+        heatmap = compute_hourly_heatmap(hourly)
+        if not heatmap or is_price_off_trend(
+            quote.price_copper, heatmap.get("trend_price_copper")
+        ):
+            continue
+
+        flip = compute_next_hour_flip(quote.price_copper, heatmap)
+        if not flip or flip["profit_pct"] < min_profit_pct:
+            continue
+
+        rows.append({
+            **good,
+            "wowhead_url": f"https://www.wowhead.com/item={item_id}",
+            "price_copper": quote.price_copper,
+            "quantity": quote.quantity,
+            "sell_label": "Sell in ~1h",
             **flip,
         })
 
@@ -1649,7 +1930,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div class="tabs">
   <button class="tab-btn active" data-tab="overview" type="button">Overview</button>
-  <button class="tab-btn" data-tab="prediction" type="button">Prediction</button>
+  <button class="tab-btn" data-tab="prediction" type="button">Forecast</button>
 </div>
 
 <div id="tab-overview" class="tab-content">
@@ -1946,7 +2227,7 @@ def render_html_report(
         .replace("__RECIPES_CARD__", render_recipes_card(recipe_rows, item_name))
         .replace("__RECOMMENDATION_PILL__", render_recommendation_pill(baseline, recommendation))
         .replace("__WEEKDAY_HEATMAP__", render_weekday_heatmap_html(weekday_heatmap, current_price))
-        .replace("__PREDICTION_TAB__", render_prediction_tab_html(prediction))
+        .replace("__PREDICTION_TAB__", render_prediction_tab_html(prediction, current_price))
         .replace(
             "__BASELINE_WINDOW_DAYS__",
             str(weekday_heatmap["window_days"] if weekday_heatmap else BASELINE_WINDOW_DAYS),

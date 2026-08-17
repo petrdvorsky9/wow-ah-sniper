@@ -29,10 +29,12 @@ from item_report import (
     DEFAULT_REALM,
     DEFAULT_REGION,
     MIN_FLIP_PROFIT_PCT,
+    MIN_HOURLY_FLIP_PROFIT_PCT,
     QUALITY_META,
     WOWHEAD_ICON_URL,
     build_flask_overview,
     build_flip_ribbon,
+    build_hourly_flip_ribbon,
     detect_scope,
     fetch_wowhead_item_meta,
     fmt_gold,
@@ -107,6 +109,37 @@ def get_flip_ribbon_cached() -> list[dict]:
         return rows
     except Exception:
         return _flip_ribbon_cache["rows"] or []
+
+
+# ── Midnight quick-flip ribbon cache (buy now, sell in ~1 hour) ────────────────
+
+# Shorter TTL than the daily ribbon: an "hour" pick goes stale much faster, so it's
+# worth refetching more often even though it costs one extra Undermine hourly call
+# per basket item on a cache miss.
+HOURLY_FLIP_RIBBON_TTL_SECONDS = 300
+_hourly_flip_ribbon_cache: dict = {"rows": None, "fetched_at": 0.0}
+
+
+def get_hourly_flip_ribbon_cached() -> list[dict]:
+    """Cached wrapper around `build_hourly_flip_ribbon` — refreshes at most once
+    every `HOURLY_FLIP_RIBBON_TTL_SECONDS`. On a refresh failure, keeps serving the
+    last good data rather than blanking out the landing page. An empty list is a
+    valid (cacheable) result — nothing in the basket cleared the profit bar this
+    hour, not that the fetch failed."""
+    now = time.monotonic()
+    if _hourly_flip_ribbon_cache["rows"] is not None and (
+        now - _hourly_flip_ribbon_cache["fetched_at"] < HOURLY_FLIP_RIBBON_TTL_SECONDS
+    ):
+        return _hourly_flip_ribbon_cache["rows"]
+    try:
+        client = UndermineClient()
+        rows = build_hourly_flip_ribbon(client, region="eu", limit=16)
+        _hourly_flip_ribbon_cache["rows"] = rows
+        _hourly_flip_ribbon_cache["fetched_at"] = now
+        return rows
+    except Exception:
+        return _hourly_flip_ribbon_cache["rows"] or []
+
 
 # ── shared dark theme (same palette as item_report.py's dashboard) ─────────────
 
@@ -203,19 +236,24 @@ _PAGE_SHELL = """<!DOCTYPE html>
     .flask-row { justify-content: space-between; }
     .flask-id { flex-basis: 100%; }
   }
-  .flip-ribbon-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-  .flip-ribbon-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  .flip-ribbon-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .flip-ribbon-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .flip-ribbon-body { margin-top: 12px; }
+  .box-flip.flip-collapsed .flip-ribbon-body { display: none; }
   .flip-ribbon-sub { color: var(--muted); font-size: 11px; margin-bottom: 14px; }
+  .flip-ribbon-controls { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .flip-ribbon-nav { display: flex; gap: 6px; flex-shrink: 0; }
-  .flip-nav-btn {
+  .flip-nav-btn, .flip-toggle-btn {
     width: 26px; height: 26px; border-radius: 8px;
     background: rgba(255,255,255,0.04); border: 1px solid var(--card-border); color: var(--text);
     font-size: 14px; line-height: 1; cursor: pointer; display: flex; align-items: center; justify-content: center;
     transition: background .15s, border-color .15s, opacity .15s;
   }
-  .flip-nav-btn:hover { background: rgba(240,192,64,0.12); border-color: var(--gold); color: var(--gold); }
+  .flip-nav-btn:hover, .flip-toggle-btn:hover { background: rgba(240,192,64,0.12); border-color: var(--gold); color: var(--gold); }
   .flip-nav-btn:disabled { opacity: .35; cursor: default; }
   .flip-nav-btn:disabled:hover { background: rgba(255,255,255,0.04); border-color: var(--card-border); color: var(--text); }
+  .flip-toggle-btn .chevron { display: inline-block; transition: transform .2s ease; }
+  .box-flip.flip-collapsed .flip-toggle-btn .chevron { transform: rotate(-90deg); }
   .flip-viewport { position: relative; }
   .flip-scroll {
     display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; margin: 0 -4px;
@@ -238,7 +276,7 @@ _PAGE_SHELL = """<!DOCTYPE html>
     letter-spacing: .04em; color: var(--muted); background: rgba(255,255,255,0.06);
     border-radius: 5px; padding: 2px 6px;
   }
-  .flip-card-quality { font-size: 9px; font-weight: 600; letter-spacing: .02em; }
+  .flip-card-quality { font-size: 13px; line-height: 1; }
   .flip-card-rank { font-size: 9px; color: var(--muted); margin-bottom: 8px; }
   .flip-card-id { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .flip-card-id img { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--card-border); flex-shrink: 0; }
@@ -390,37 +428,161 @@ def render_flask_overview() -> str:
 _FLIP_CAROUSEL_SCRIPT = """
 <script>
 (function () {
-  function flipEls() {
-    return {
-      scroll: document.getElementById('flip-scroll'),
-      prev: document.getElementById('flip-prev'),
-      next: document.getElementById('flip-next'),
-    };
-  }
-  window.flipScrollBy = function (dir) {
-    var scroll = flipEls().scroll;
-    if (!scroll) return;
+  function stepFor(scroll) {
     var card = scroll.querySelector('.flip-card');
-    var step = card ? card.getBoundingClientRect().width + 18 : scroll.clientWidth * 0.8;
-    scroll.scrollBy({ left: step * dir, behavior: 'smooth' });
-  };
-  function updateNav() {
-    var els = flipEls();
-    if (!els.scroll || !els.prev || !els.next) return;
-    var max = els.scroll.scrollWidth - els.scroll.clientWidth - 1;
-    els.prev.disabled = els.scroll.scrollLeft <= 0;
-    els.next.disabled = els.scroll.scrollLeft >= max;
+    return card ? card.getBoundingClientRect().width + 18 : scroll.clientWidth * 0.8;
   }
-  document.addEventListener('DOMContentLoaded', function () {
-    var scroll = flipEls().scroll;
+  function scrollOf(ribbonId) {
+    return document.querySelector('.flip-scroll[data-ribbon="' + ribbonId + '"]');
+  }
+  function updateNav(scroll) {
+    var ribbonId = scroll.getAttribute('data-ribbon');
+    var prev = document.querySelector('.flip-nav-btn[data-ribbon="' + ribbonId + '"][data-dir="-1"]');
+    var next = document.querySelector('.flip-nav-btn[data-ribbon="' + ribbonId + '"][data-dir="1"]');
+    if (!prev || !next) return;
+    var max = scroll.scrollWidth - scroll.clientWidth - 1;
+    prev.disabled = scroll.scrollLeft <= 0;
+    next.disabled = scroll.scrollLeft >= max;
+  }
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('.flip-nav-btn');
+    if (!btn) return;
+    var scroll = scrollOf(btn.getAttribute('data-ribbon'));
     if (!scroll) return;
-    scroll.addEventListener('scroll', updateNav, { passive: true });
-    window.addEventListener('resize', updateNav);
-    updateNav();
+    var dir = parseInt(btn.getAttribute('data-dir'), 10);
+    scroll.scrollBy({ left: stepFor(scroll) * dir, behavior: 'smooth' });
+  });
+  document.addEventListener('click', function (e) {
+    var toggle = e.target.closest('.flip-toggle-btn');
+    if (!toggle) return;
+    var box = toggle.closest('.box-flip');
+    if (!box) return;
+    var collapsed = box.classList.toggle('flip-collapsed');
+    toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    toggle.setAttribute('aria-label', collapsed ? 'Expand' : 'Collapse');
+    if (!collapsed) {
+      var scroll = scrollOf(box.getAttribute('data-ribbon-box'));
+      if (scroll) updateNav(scroll);
+    }
+  });
+  document.addEventListener('DOMContentLoaded', function () {
+    var scrolls = document.querySelectorAll('.flip-scroll');
+    scrolls.forEach(function (scroll) {
+      scroll.addEventListener('scroll', function () { updateNav(scroll); }, { passive: true });
+      updateNav(scroll);
+    });
+    window.addEventListener('resize', function () {
+      scrolls.forEach(updateNav);
+    });
   });
 })();
 </script>
 """
+
+
+def _render_flip_card(r: dict) -> str:
+    icon_img = f'<img src="{WOWHEAD_ICON_URL.format(icon=r["icon"])}" alt="">' if r.get("icon") else ""
+    cat_label = CATEGORY_LABELS.get(r["category"], r["category"].title())
+    _, quality_color = QUALITY_META.get(r.get("quality", 1), QUALITY_META[1])
+    rank_label = r.get("rank")
+    sign = "+" if r["profit_copper"] >= 0 else "-"
+    return (
+        '<div class="flip-card">'
+        '<div class="flip-card-tags">'
+        f'<span class="flip-card-cat">{html_escape(cat_label)}</span>'
+        f'<span class="flip-card-quality" style="color:{quality_color}">&#9679;</span>'
+        "</div>"
+        + (f'<div class="flip-card-rank">&#9670; {html_escape(rank_label)}</div>' if rank_label else "")
+        + '<div class="flip-card-id">'
+        f"{icon_img}"
+        '<div class="flip-card-name">'
+        f'<a href="{r["wowhead_url"]}" target="_blank" rel="noopener noreferrer" '
+        f'style="color:{quality_color}">{html_escape(r["name"])}</a>'
+        "</div>"
+        "</div>"
+        f'<div class="flip-card-row"><span>Buy now</span><span class="v">{html_escape(fmt_gold(r["price_copper"]))}</span></div>'
+        f'<div class="flip-card-row"><span>{html_escape(r["sell_label"])}</span>'
+        f'<span class="v">{html_escape(fmt_gold(r["net_sell_copper"]))}</span></div>'
+        '<div class="flip-card-profit">'
+        f'{sign}{html_escape(fmt_gold(abs(r["profit_copper"])))}'
+        f'<div class="flip-card-profit-sub">{r["profit_pct"]:+.0f}% after 5% AH cut</div>'
+        "</div>"
+        f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
+        "</div>"
+    )
+
+
+def _render_flip_ribbon_box(
+    rows: list[dict] | None,
+    *,
+    ribbon_id: str,
+    title: str,
+    subtitle: str,
+    empty_pct: float,
+    empty_hint: str,
+) -> str:
+    """Shared renderer for both flip ribbons (buy-tomorrow and buy-in-an-hour) —
+    same card layout, carousel behavior, and collapse/expand behavior, just
+    different data/copy. `ribbon_id` must be unique per box so the shared script
+    (`_FLIP_CAROUSEL_SCRIPT`, included once for the whole page) can wire up each
+    box's own nav buttons and collapse toggle.
+
+    Collapsed by default when there's nothing worth showing (empty picks), so the
+    landing page isn't cluttered with a box that's just an explanatory sentence;
+    expanded by default whenever there are actual picks. Either way the user can
+    still toggle it manually via the chevron button."""
+    if rows is None:
+        return ""
+
+    expanded = bool(rows)
+
+    # Shown right under the header, outside the collapsible body, so it's visible
+    # even while the box is collapsed — no need to expand an empty box just to
+    # find out *why* it's empty.
+    empty_note_html = (
+        f'<div class="flip-empty">No flips clear the {empty_pct:.0f}% profit bar '
+        f"right now &mdash; {empty_hint}.</div>"
+        if not rows else ""
+    )
+
+    if rows:
+        cards_html = (
+            '<div class="flip-viewport">'
+            f'<div class="flip-scroll" data-ribbon="{ribbon_id}">'
+            + "".join(_render_flip_card(r) for r in rows)
+            + "</div></div>"
+        )
+    else:
+        cards_html = ""
+
+    nav_html = (
+        '<div class="flip-ribbon-nav">'
+        f'<button type="button" class="flip-nav-btn" data-ribbon="{ribbon_id}" data-dir="-1" aria-label="Previous">&lsaquo;</button>'
+        f'<button type="button" class="flip-nav-btn" data-ribbon="{ribbon_id}" data-dir="1" aria-label="Next">&rsaquo;</button>'
+        "</div>"
+        if rows else ""
+    )
+
+    toggle_btn = (
+        f'<button type="button" class="flip-toggle-btn" data-ribbon-toggle="{ribbon_id}" '
+        f'aria-expanded="{"true" if expanded else "false"}" '
+        f'aria-label="{"Collapse" if expanded else "Expand"}">'
+        '<span class="chevron">&#9662;</span></button>'
+    )
+
+    return (
+        f'<div class="box box-flip{"" if expanded else " flip-collapsed"}" data-ribbon-box="{ribbon_id}">'
+        '<div class="flip-ribbon-head">'
+        f'<div class="flip-ribbon-title">{title}</div>'
+        f'<div class="flip-ribbon-controls">{nav_html}{toggle_btn}</div>'
+        "</div>"
+        f"{empty_note_html}"
+        f'<div class="flip-ribbon-body" data-ribbon-body="{ribbon_id}">'
+        f'<div class="flip-ribbon-sub">{subtitle}</div>'
+        f"{cards_html}"
+        "</div>"
+        "</div>"
+    )
 
 
 def render_flip_ribbon() -> str:
@@ -430,76 +592,41 @@ def render_flip_ribbon() -> str:
     Returns "" if the cache hasn't fetched anything yet (e.g. very first request
     while the initial fetch is in flight) — a genuinely empty *result* (no
     profitable flips today) still renders the box with a friendly empty state."""
-    rows = get_flip_ribbon_cached()
-    if rows is None:
-        return ""
-
-    if not rows:
-        cards_html = (
-            '<div class="flip-empty">No short flips clear the '
-            f'{MIN_FLIP_PROFIT_PCT:.0f}% profit bar right now '
-            "&mdash; check back later today or tomorrow.</div>"
-        )
-    else:
-        cards = []
-        for r in rows:
-            icon_img = f'<img src="{WOWHEAD_ICON_URL.format(icon=r["icon"])}" alt="">' if r.get("icon") else ""
-            cat_label = CATEGORY_LABELS.get(r["category"], r["category"].title())
-            quality_label, quality_color = QUALITY_META.get(r.get("quality", 1), QUALITY_META[1])
-            rank_label = r.get("rank")
-            sign = "+" if r["profit_copper"] >= 0 else "-"
-            cards.append(
-                '<div class="flip-card">'
-                '<div class="flip-card-tags">'
-                f'<span class="flip-card-cat">{html_escape(cat_label)}</span>'
-                f'<span class="flip-card-quality" style="color:{quality_color}">'
-                f'&#9679; {html_escape(quality_label)}</span>'
-                "</div>"
-                + (f'<div class="flip-card-rank">&#9670; {html_escape(rank_label)}</div>' if rank_label else "")
-                + '<div class="flip-card-id">'
-                f"{icon_img}"
-                '<div class="flip-card-name">'
-                f'<a href="{r["wowhead_url"]}" target="_blank" rel="noopener noreferrer" '
-                f'style="color:{quality_color}">{html_escape(r["name"])}</a>'
-                "</div>"
-                "</div>"
-                f'<div class="flip-card-row"><span>Buy now</span><span class="v">{html_escape(fmt_gold(r["price_copper"]))}</span></div>'
-                f'<div class="flip-card-row"><span>Sell {html_escape(r["tomorrow_weekday"])}</span>'
-                f'<span class="v">{html_escape(fmt_gold(r["net_sell_copper"]))}</span></div>'
-                '<div class="flip-card-profit">'
-                f'{sign}{html_escape(fmt_gold(abs(r["profit_copper"])))}'
-                f'<div class="flip-card-profit-sub">{r["profit_pct"]:+.0f}% after 5% AH cut</div>'
-                "</div>"
-                f'<a class="flip-card-btn" href="/report?q={r["item_id"]}&region=eu&recipes=0">Report</a>'
-                "</div>"
-            )
-        cards_html = (
-            '<div class="flip-viewport">'
-            '<div class="flip-scroll" id="flip-scroll">' + "".join(cards) + "</div>"
-            "</div>"
-        )
-
-    nav_html = (
-        '<div class="flip-ribbon-nav">'
-        '<button type="button" class="flip-nav-btn" id="flip-prev" aria-label="Previous" onclick="flipScrollBy(-1)">&lsaquo;</button>'
-        '<button type="button" class="flip-nav-btn" id="flip-next" aria-label="Next" onclick="flipScrollBy(1)">&rsaquo;</button>'
-        "</div>"
-        if rows else ""
+    return _render_flip_ribbon_box(
+        get_flip_ribbon_cached(),
+        ribbon_id="daily",
+        title="Midnight Short Flips &middot; Buy Today, Sell Tomorrow &middot; EU",
+        subtitle=(
+            "Ranked by net profit after the 5% AH cut, using each item's historical weekday price pattern. "
+            "&#9679; dot = item quality (white/green/blue/purple = Common/Uncommon/Rare/Epic). "
+            "&#9670; tag = crafting quality tier (same meaning as the Midnight Flasks box below) &mdash; raw materials show "
+            "the lower-quality tier (the higher-quality tier of the same item costs more), flasks/phials/potions always show "
+            "the higher-quality recipe rank. Every item here is Midnight-only, none are ported from Dragonflight."
+        ),
+        empty_pct=MIN_FLIP_PROFIT_PCT,
+        empty_hint="check back later today or tomorrow",
     )
 
-    return (
-        '<div class="box box-flip">'
-        '<div class="flip-ribbon-head">'
-        '<div><div class="flip-ribbon-title">Midnight Short Flips &middot; Buy Today, Sell Tomorrow &middot; EU</div>'
-        '<div class="flip-ribbon-sub">Ranked by net profit after the 5% AH cut, using each item\'s historical weekday price pattern. '
-        '&#9679; dot = item quality (white/green/blue/purple = Common/Uncommon/Rare/Epic). '
-        '&#9670; tag = crafting rank &mdash; raw materials show the cheaper Silver rank (Gold-rank listings of the same item cost more), '
-        'flasks/phials/potions show the max recipe rank. Every item here is Midnight-only, none are ported from Dragonflight.</div></div>'
-        f"{nav_html}"
-        "</div>"
-        f"{cards_html}"
-        "</div>"
-        + (_FLIP_CAROUSEL_SCRIPT if rows else "")
+
+def render_hourly_flip_ribbon() -> str:
+    """Standalone landing-page box: top "buy now, sell in about an hour" picks
+    across the same Midnight basket, ranked by net profit after the 5% AH cut,
+    using each item's detrended, outlier-robust hour-of-day price pattern (from
+    ~14 days of hourly snapshots) instead of the weekday one. Returns "" if the
+    cache hasn't fetched anything yet."""
+    return _render_flip_ribbon_box(
+        get_hourly_flip_ribbon_cached(),
+        ribbon_id="hourly",
+        title="Midnight Quick Flips &middot; Buy Now, Sell in ~1 Hour &middot; EU",
+        subtitle=(
+            "Ranked by net profit after the 5% AH cut, comparing the current price to each item's detrended, "
+            "outlier-robust historical price pattern for the upcoming hour (from ~14 days of hourly snapshots). "
+            "&#9679; dot = item quality (white/green/blue/purple = Common/Uncommon/Rare/Epic). "
+            "&#9670; tag = crafting quality tier (same meaning as the Midnight Flasks box below). "
+            "Hour-to-hour moves are naturally smaller than day-to-day ones, so treat these as tighter, faster turnarounds."
+        ),
+        empty_pct=MIN_HOURLY_FLIP_PROFIT_PCT,
+        empty_hint="check back again in a bit",
     )
 
 
@@ -510,6 +637,7 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
     )
     body = f"""
 {render_flip_ribbon()}
+{render_hourly_flip_ribbon()}
 <div class="box box-wide">
 <h1>WoW AH Sniper</h1>
 <div class="sub">Search any auction house item to see its live price dashboard.</div>
@@ -546,6 +674,7 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
 </div>
 {render_flask_overview()}
 </div>
+{_FLIP_CAROUSEL_SCRIPT}
 """
     return _page("WoW AH Sniper", body)
 
