@@ -34,6 +34,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote as url_quote
+from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -50,6 +51,14 @@ from undermine_client import (
 # ── defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_REALM = "drakthul"
 DEFAULT_REGION = "eu"
+
+# "Today"/"tomorrow" for buy/sell decisions (compute_recommendation, compute_tomorrow_flip)
+# and the report's own 14-day day-bucketing (daily_ranges) are anchored to this timezone
+# rather than UTC, so the weekday shown/compared always matches the calendar day for a
+# Central European viewer — Europe/Prague auto-handles the CET/CEST switch, unlike a
+# fixed UTC+1/+2 offset. Undermine's own long-range daily history endpoint (DailySnapshot)
+# is bucketed upstream by Undermine itself and can't be re-bucketed on our end.
+LOCAL_TZ = ZoneInfo("Europe/Prague")
 CHART_DAYS = 7
 DAILY_HISTORY_DAYS = 14
 BASELINE_WINDOW_DAYS = 30
@@ -96,13 +105,13 @@ WEEKDAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 def daily_ranges(snapshots: list[PriceSnapshot]) -> dict[str, dict]:
-    """Group hourly snapshots by UTC date and compute min/max/avg price per day."""
+    """Group hourly snapshots by local (LOCAL_TZ) date and compute min/max/avg price per day."""
     by_day: dict[str, list[int]] = defaultdict(list)
     qty_by_day: dict[str, list[int]] = defaultdict(list)
     for s in snapshots:
         if s.price_copper <= 0:
             continue
-        day = parse_dt(s.snapshot).strftime("%Y-%m-%d")
+        day = parse_dt(s.snapshot).astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
         by_day[day].append(s.price_copper)
         qty_by_day[day].append(s.quantity)
     result = {}
@@ -183,7 +192,7 @@ def compute_recommendation(
     if not weekday_heatmap:
         return None
 
-    today_wd = datetime.now(timezone.utc).strftime("%a")
+    today_wd = datetime.now(LOCAL_TZ).strftime("%a")
     today_cell = next(
         (d for d in weekday_heatmap["days"] if d["weekday"] == today_wd and d["samples"] > 0),
         None,
@@ -958,7 +967,7 @@ def compute_tomorrow_flip(
     if not current_price_copper or current_price_copper <= 0 or not heatmap:
         return None
 
-    tomorrow_wd = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%a")
+    tomorrow_wd = (datetime.now(LOCAL_TZ) + timedelta(days=1)).strftime("%a")
     day = next(
         (d for d in heatmap["days"] if d["weekday"] == tomorrow_wd and d["samples"] > 0), None,
     )
