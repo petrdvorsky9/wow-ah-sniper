@@ -402,8 +402,9 @@ def render_flask_overview() -> str:
         signal = r["today_signal"]
         if signal:
             badge = (
-                f'<div class="flask-badge flask-badge-{signal["action"]}">'
-                f'{html_escape(signal["label"])} ({signal["pct"]:+.0f}%)</div>'
+                f'<div class="flask-badge flask-badge-{signal["action"]}" '
+                'title="% vs. this item\'s overall trend level, not vs. the current price above">'
+                f'{html_escape(signal["label"])} ({signal["pct"]:+.0f}% vs trend)</div>'
             )
         else:
             badge = '<div class="flask-badge flask-badge-neutral">No weekday data yet</div>'

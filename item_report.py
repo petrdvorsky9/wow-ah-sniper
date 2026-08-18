@@ -426,7 +426,7 @@ def render_weekday_heatmap_html(heatmap: dict | None, current_price_copper: int 
 
     return (
         '<div class="heatmap-section">'
-        '<div class="heatmap-row-label">Price vs. window avg &middot; green = buy-strong, pink = sell-strong</div>'
+        '<div class="heatmap-row-label" title="% vs. this item\'s overall trend level for the window, not vs. today\'s actual price">Price vs. trend &middot; green = buy-strong, pink = sell-strong</div>'
         f'<div class="heatmap-grid">{"".join(price_cells)}</div>'
         "</div>"
         '<div class="heatmap-section">'
