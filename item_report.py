@@ -53,7 +53,7 @@ DEFAULT_REGION = "eu"
 CHART_DAYS = 7
 DAILY_HISTORY_DAYS = 14
 BASELINE_WINDOW_DAYS = 30
-RECOMMENDATION_THRESHOLD_PCT = 0.10  # how far from baseline before Buy/Sell instead of Hold
+RECOMMENDATION_THRESHOLD_PCT = 0.10  # how far from today's typical weekday price before Buy/Sell instead of Hold
 AH_SALE_CUT_PCT = 0.05  # WoW auction house's cut taken on a successful sale
 
 # 60 days rather than 30: the prediction's weekday-seasonality component needs
@@ -156,49 +156,67 @@ def compute_baseline(
 
 def compute_recommendation(
     current_price_copper: int,
-    baseline: dict | None,
+    weekday_heatmap: dict | None,
     threshold_pct: float = RECOMMENDATION_THRESHOLD_PCT,
     sale_cut_pct: float = AH_SALE_CUT_PCT,
 ) -> dict | None:
-    """Buy/Sell/Hold call based on how the current price compares to the baseline
-    average.
+    """Buy/Sell/Hold call based on how the current price compares to what
+    *today's specific weekday* normally looks like right now.
+
+    Deliberately reuses `compute_weekday_heatmap`'s trend + weekday-median-residual
+    model (today's cell's `avg_price_copper`) as the reference point, instead of a
+    flat historical average — the same detrended, weekday-aware number the landing
+    page's "Good day to buy/sell" badge and the report's weekday heatmap are already
+    built from. This is what keeps this Buy/Sell/Hold call from visually
+    contradicting those — e.g. a weekday that historically runs hot no longer looks
+    like a "Hold" just because a flat multi-week average doesn't know today is
+    usually pricier than most other days.
 
     The AH takes a `sale_cut_pct` cut on every completed sale (paid by the seller,
     not the buyer) — a seller only nets `price * (1 - sale_cut_pct)`. So it takes a
-    bigger premium over baseline to be worth *selling* than it takes a discount to
-    be worth *buying*; the sell threshold is adjusted accordingly. Returns None if
-    there's no baseline to compare against.
+    bigger premium over the reference to be worth *selling* than it takes a discount
+    to be worth *buying*; the sell threshold is adjusted accordingly. Returns None if
+    there's no weekday heatmap, or too few samples for today specifically, to compare
+    against.
     """
-    if not baseline or baseline["avg_copper"] <= 0:
+    if not weekday_heatmap:
         return None
 
-    avg = baseline["avg_copper"]
-    window_days = baseline["window_days"]
-    pct_vs_baseline = (current_price_copper - avg) / avg * 100
+    today_wd = datetime.now(timezone.utc).strftime("%a")
+    today_cell = next(
+        (d for d in weekday_heatmap["days"] if d["weekday"] == today_wd and d["samples"] > 0),
+        None,
+    )
+    if not today_cell or not today_cell["avg_price_copper"]:
+        return None
 
-    buy_cutoff = avg * (1 - threshold_pct)
+    expected = today_cell["avg_price_copper"]
+    window_days = weekday_heatmap["window_days"]
+    pct_vs_expected = (current_price_copper - expected) / expected * 100
+
+    buy_cutoff = expected * (1 - threshold_pct)
     # Selling nets you price*(1 - sale_cut_pct), so the *listing* price has to clear
-    # a higher bar than a plain "+threshold_pct" over baseline to actually net that
-    # much after the AH's cut — hence dividing by (1 - sale_cut_pct) here too.
-    sell_cutoff = avg * (1 + threshold_pct) / (1 - sale_cut_pct)
+    # a higher bar than a plain "+threshold_pct" over the reference to actually net
+    # that much after the AH's cut — hence dividing by (1 - sale_cut_pct) here too.
+    sell_cutoff = expected * (1 + threshold_pct) / (1 - sale_cut_pct)
     # Price to list *this* item at right now so that, after the AH cut, you clear
     # threshold_pct profit over what you're paying/holding at today — independent of
-    # the baseline, useful even on a Hold.
+    # the reference, useful even on a Hold.
     target_sell_price = current_price_copper * (1 + threshold_pct) / (1 - sale_cut_pct)
 
     if current_price_copper <= buy_cutoff:
         action = "buy"
         label = "Good time to buy"
         detail = (
-            f"{abs(pct_vs_baseline):.0f}% below the {window_days}d average "
+            f"{abs(pct_vs_expected):.0f}% below the usual {today_wd} price "
             f"(buy cutoff: {fmt_gold(int(buy_cutoff))})"
         )
     elif current_price_copper >= sell_cutoff:
         action = "sell"
         label = "Good time to sell"
-        net_pct = ((current_price_copper * (1 - sale_cut_pct)) - avg) / avg * 100
+        net_pct = ((current_price_copper * (1 - sale_cut_pct)) - expected) / expected * 100
         detail = (
-            f"nets +{net_pct:.0f}% over the {window_days}d average "
+            f"nets +{net_pct:.0f}% over the usual {today_wd} price "
             f"after the {sale_cut_pct * 100:.0f}% AH cut"
         )
     else:
@@ -206,14 +224,17 @@ def compute_recommendation(
         label = "Fair price"
         detail = (
             f"between the buy cutoff ({fmt_gold(int(buy_cutoff))}) and "
-            f"sell cutoff ({fmt_gold(int(sell_cutoff))})"
+            f"sell cutoff ({fmt_gold(int(sell_cutoff))}) for a typical {today_wd}"
         )
 
     return {
         "action": action,
         "label": label,
         "detail": detail,
-        "pct_vs_baseline": pct_vs_baseline,
+        "pct_vs_expected": pct_vs_expected,
+        "expected_copper": int(round(expected)),
+        "today_weekday": today_wd,
+        "window_days": window_days,
         "buy_cutoff_copper": int(buy_cutoff),
         "sell_cutoff_copper": int(sell_cutoff),
         "target_sell_price_copper": int(target_sell_price),
@@ -458,12 +479,13 @@ def compute_price_prediction(
     `window_days` of daily history (or fewer if that's all Undermine has).
 
     Method — deliberately simple/explainable rather than a black-box model,
-    consistent with the baseline/heatmap logic above:
+    consistent with the weekday heatmap/recommendation logic above:
       1. Fit a linear trend (least-squares regression on day index) to capture
          overall drift over the window.
-      2. Layer a per-weekday seasonal offset on top: each weekday's average
-         deviation from its own trend value (same idea as `compute_weekday_heatmap`,
-         applied forward instead of backward).
+      2. Layer a per-weekday seasonal offset on top: each weekday's *median*
+         deviation from its own trend value — same method (and, for the shared
+         window, the same numbers) as `compute_weekday_heatmap`/`compute_recommendation`
+         use looking backward at "today", just applied forward instead.
       3. Widen the confidence band by sqrt(days-ahead), since a random-walk-style
          forecast's uncertainty compounds the further out it goes.
 
@@ -487,7 +509,7 @@ def compute_price_prediction(
     weekday_residuals: dict[str, list[float]] = defaultdict(list)
     for x, y, dt in zip(xs, ys, dates):
         weekday_residuals[dt.strftime("%a")].append(y - (slope * x + intercept))
-    weekday_adj = {wd: sum(vals) / len(vals) for wd, vals in weekday_residuals.items()}
+    weekday_adj = {wd: _median(vals) for wd, vals in weekday_residuals.items()}
 
     residuals_flat = [
         y - (slope * x + intercept) - weekday_adj[dt.strftime("%a")]
@@ -2151,10 +2173,11 @@ tabBtns.forEach((btn) => {
 """
 
 
-def render_recommendation_pill(baseline: dict | None, recommendation: dict | None) -> str:
-    """Render the headline 'Recommendation' pill (Buy/Sell/Hold vs. the baseline
-    average), or "" if there wasn't enough daily history to compute one."""
-    if not baseline or not recommendation:
+def render_recommendation_pill(recommendation: dict | None) -> str:
+    """Render the headline 'Recommendation' pill (Buy/Sell/Hold vs. the usual price
+    for today's specific weekday — see `compute_recommendation`), or "" if there
+    wasn't enough daily history to compute one."""
+    if not recommendation:
         return ""
     action = recommendation["action"]
     value_label = {"buy": "BUY", "sell": "SELL", "hold": "HOLD"}[action]
@@ -2167,9 +2190,14 @@ def render_recommendation_pill(baseline: dict | None, recommendation: dict | Non
             f'<strong>{html_escape(fmt_gold(target_sell))}</strong> for +{profit_pct:.0f}% '
             "profit on today's price, after the AH cut</div>"
         )
+    label_text = (
+        f'Typical {recommendation["today_weekday"]} price &middot; '
+        f'{html_escape(fmt_gold(recommendation["expected_copper"]))} '
+        f'({recommendation["window_days"]}d trend)'
+    )
     return (
         f'<div class="pill pill-{action}">'
-        f'<div class="label">{baseline["window_days"]}d Baseline &middot; {html_escape(fmt_gold(baseline["avg_copper"]))}</div>'
+        f'<div class="label">{label_text}</div>'
         f'<div class="value">{value_label}</div>'
         f'<div class="pill-sub">{html_escape(recommendation["detail"])}</div>'
         f"{target_line}"
@@ -2190,7 +2218,6 @@ def render_html_report(
     out_path: Path | None = None,
     recipe_rows: list[dict] | None = None,
     recipes_requested: bool = True,
-    baseline: dict | None = None,
     recommendation: dict | None = None,
     weekday_heatmap: dict | None = None,
     prediction: dict | None = None,
@@ -2277,7 +2304,7 @@ def render_html_report(
         .replace("__GENERATED_AT__", now_utc.strftime("%Y-%m-%d %H:%M UTC"))
         .replace("__DATA_JSON__", json.dumps(data))
         .replace("__RECIPES_CARD__", render_recipes_card(recipe_rows, item_name, requested=recipes_requested))
-        .replace("__RECOMMENDATION_PILL__", render_recommendation_pill(baseline, recommendation))
+        .replace("__RECOMMENDATION_PILL__", render_recommendation_pill(recommendation))
         .replace("__WEEKDAY_HEATMAP__", render_weekday_heatmap_html(weekday_heatmap, current_price))
         .replace("__PREDICTION_TAB__", render_prediction_tab_html(prediction, current_price))
         .replace(
@@ -2317,7 +2344,6 @@ def print_report(
     last_updated: str | None,
     snapshots_all: list[PriceSnapshot],
     chart_path: Path | None,
-    baseline: dict | None = None,
     recommendation: dict | None = None,
     prediction: dict | None = None,
 ) -> None:
@@ -2354,9 +2380,10 @@ def print_report(
     print(f"{'═' * W}")
     print(f"  Current price   {fmt_gold(current_price):<24}  ×{current_qty:,} on AH")
     print(f"  24h range       {fmt_gold(h24_min)}  –  {fmt_gold(h24_max)}")
-    if baseline and recommendation:
+    if recommendation:
+        typical_label = f"Typical {recommendation['today_weekday']}"
         print(
-            f"  {baseline['window_days']}d baseline    {fmt_gold(baseline['avg_copper']):<24}  "
+            f"  {typical_label:<14}  {fmt_gold(recommendation['expected_copper']):<24}  "
             f"{recommendation['label'].upper()} ({recommendation['detail']})"
         )
         target_sell = recommendation.get("target_sell_price_copper")
@@ -2526,15 +2553,20 @@ def generate_report(
 
     daily = fetch_daily_history(client, commodity, realm, region, item_id)
     baseline = compute_baseline(daily)
-    recommendation = compute_recommendation(quote.price_copper, baseline)
     weekday_heatmap = compute_weekday_heatmap(daily)
+    # Buy/Sell/Hold is intentionally computed from the weekday heatmap (today's
+    # trend + seasonal-offset price), not the flat `baseline` average — see
+    # compute_recommendation's docstring for why: it's what keeps this call from
+    # visually contradicting the "Good day to buy/sell" badge and weekday heatmap
+    # elsewhere in the report, which are built from the exact same reference.
+    recommendation = compute_recommendation(quote.price_copper, weekday_heatmap)
     prediction = compute_price_prediction(daily)
 
     html = render_html_report(
         item_name, item_id, commodity, realm, region,
         quote.price_copper, quote.quantity, quote.last_updated,
         hourly, html_path, recipe_rows=recipe_rows, recipes_requested=include_recipes,
-        baseline=baseline, recommendation=recommendation,
+        recommendation=recommendation,
         weekday_heatmap=weekday_heatmap, prediction=prediction,
     )
 
@@ -2673,7 +2705,7 @@ def main() -> None:
             item_name, item_id, commodity, realm, region,
             now_quote.price_copper, now_quote.quantity,
             now_quote.last_updated, hourly, chart_path,
-            baseline=baseline, recommendation=recommendation,
+            recommendation=recommendation,
             prediction=prediction,
         )
 
