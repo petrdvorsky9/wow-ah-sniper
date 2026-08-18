@@ -210,7 +210,7 @@ _PAGE_SHELL = """<!DOCTYPE html>
   }
   .flask-badge-buy { background: rgba(34,197,94,0.15); color: var(--green); }
   .flask-badge-sell { background: rgba(236,72,153,0.15); color: var(--pink); }
-  .flask-badge-neutral { background: rgba(255,255,255,0.06); color: var(--muted); }
+  .flask-badge-hold, .flask-badge-neutral { background: rgba(255,255,255,0.06); color: var(--muted); }
   .flask-unavailable { color: var(--muted); }
   .flask-btn {
     display: inline-block;
@@ -403,8 +403,9 @@ def render_flask_overview() -> str:
         if signal:
             badge = (
                 f'<div class="flask-badge flask-badge-{signal["action"]}" '
-                'title="% vs. this item\'s overall trend level, not vs. the current price above">'
-                f'{html_escape(signal["label"])} ({signal["pct"]:+.0f}% vs trend)</div>'
+                f'title="% vs. typical {signal["weekday"]} price, the same reference the report\'s '
+                'Buy/Sell/Hold call uses">'
+                f'{html_escape(signal["label"])} ({signal["pct"]:+.0f}% vs typical {signal["weekday"]})</div>'
             )
         else:
             badge = '<div class="flask-badge flask-badge-neutral">No weekday data yet</div>'

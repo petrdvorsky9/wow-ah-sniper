@@ -165,11 +165,12 @@ def compute_recommendation(
 
     Deliberately reuses `compute_weekday_heatmap`'s trend + weekday-median-residual
     model (today's cell's `avg_price_copper`) as the reference point, instead of a
-    flat historical average — the same detrended, weekday-aware number the landing
-    page's "Good day to buy/sell" badge and the report's weekday heatmap are already
-    built from. This is what keeps this Buy/Sell/Hold call from visually
-    contradicting those — e.g. a weekday that historically runs hot no longer looks
-    like a "Hold" just because a flat multi-week average doesn't know today is
+    flat historical average — the same detrended, weekday-aware number the report's
+    weekday heatmap is built from, and (via `build_flask_overview`, which calls this
+    same function directly) the landing page's flask badge too. This is what keeps
+    this Buy/Sell/Hold call from visually contradicting those — e.g. a weekday that
+    historically runs hot no longer looks like a "Hold" just because a flat
+    multi-week average doesn't know today is
     usually pricier than most other days.
 
     The AH takes a `sale_cut_pct` cut on every completed sale (paid by the seller,
@@ -692,18 +693,19 @@ MIDNIGHT_FLASKS = [
     },
 ]
 
-TODAY_SIGNAL_THRESHOLD_PCT = 5.0  # weekday price deviation needed to call today buy/sell-strong
-
-
 def build_flask_overview(client: UndermineClient, region: str = "eu") -> list[dict]:
-    """Price + "is today a good day to buy/sell" signal for each higher-quality Midnight
-    combat flask, for the webapp landing page.
+    """Price + Buy/Sell/Hold signal for each higher-quality Midnight combat flask,
+    for the webapp landing page.
+
+    Deliberately uses the exact same `compute_recommendation` call as the item report
+    page (not a separate "is today typically a good day" signal), so this landing-page
+    badge can never visually disagree with what you'd see after clicking through to
+    the report for the same item.
 
     Best-effort per flask: an item Undermine doesn't track yet, or one with too little
     daily history to build a weekday pattern, still comes back with whatever data is
     available (see "available" / "today_signal" in each row) rather than failing outright.
     """
-    today_wd = datetime.now(timezone.utc).strftime("%a")
     rows = []
     for flask in MIDNIGHT_FLASKS:
         item_id = flask["item_id"]
@@ -733,21 +735,18 @@ def build_flask_overview(client: UndermineClient, region: str = "eu") -> list[di
 
         daily = fetch_daily_history(client, True, DEFAULT_REALM, region, item_id)
         heatmap = compute_weekday_heatmap(daily)
-        today_cell = None
-        if heatmap:
-            today_cell = next(
-                (d for d in heatmap["days"] if d["weekday"] == today_wd and d["samples"] > 0),
-                None,
-            )
-        if today_cell:
-            pct = today_cell["price_pct"]
-            if pct <= -TODAY_SIGNAL_THRESHOLD_PCT:
-                action, label = "buy", "Good day to buy"
-            elif pct >= TODAY_SIGNAL_THRESHOLD_PCT:
-                action, label = "sell", "Good day to sell"
-            else:
-                action, label = "neutral", "Average day"
-            row["today_signal"] = {"action": action, "label": label, "pct": pct}
+        recommendation = compute_recommendation(quote.price_copper, heatmap)
+        if recommendation:
+            action = recommendation["action"]
+            label = {
+                "buy": "Good time to buy", "sell": "Good time to sell", "hold": "Fair price",
+            }[action]
+            row["today_signal"] = {
+                "action": action,
+                "label": label,
+                "pct": recommendation["pct_vs_expected"],
+                "weekday": recommendation["today_weekday"],
+            }
 
         rows.append(row)
     return rows
@@ -2557,8 +2556,8 @@ def generate_report(
     # Buy/Sell/Hold is intentionally computed from the weekday heatmap (today's
     # trend + seasonal-offset price), not the flat `baseline` average — see
     # compute_recommendation's docstring for why: it's what keeps this call from
-    # visually contradicting the "Good day to buy/sell" badge and weekday heatmap
-    # elsewhere in the report, which are built from the exact same reference.
+    # visually contradicting the weekday heatmap elsewhere in the report and the
+    # landing page's flask badge (which calls this exact function too).
     recommendation = compute_recommendation(quote.price_copper, weekday_heatmap)
     prediction = compute_price_prediction(daily)
 
