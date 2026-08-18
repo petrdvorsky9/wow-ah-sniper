@@ -66,6 +66,38 @@ _RATE_LIMITED_MESSAGE = (
     "item — please wait a few minutes and try again."
 )
 
+# Tracks whether the *last* attempt to talk to Undermine (from either landing-page
+# ribbon refresh or a /report lookup) hit a 429, so the landing page can show a banner
+# instead of silently falling back to stale/cached data. Cleared the moment any request
+# succeeds again — there's no separate timeout, since that's the most accurate signal
+# we have of whether the shared API key's quota has actually replenished yet.
+_rate_limit_state: dict = {"active": False, "detected_at": 0.0}
+
+
+def _mark_rate_limited() -> None:
+    if not _rate_limit_state["active"]:
+        _rate_limit_state["detected_at"] = time.monotonic()
+    _rate_limit_state["active"] = True
+
+
+def _mark_rate_limit_cleared() -> None:
+    _rate_limit_state["active"] = False
+
+
+def _rate_limit_banner_html() -> str:
+    if not _rate_limit_state["active"]:
+        return ""
+    mins = int((time.monotonic() - _rate_limit_state["detected_at"]) // 60)
+    since = f"{mins}m ago" if mins > 0 else "just now"
+    return (
+        '<div class="rate-limit-banner">'
+        "&#9888; Out of Undermine Exchange API calls right now (shared key's hourly quota "
+        f"is exhausted — first noticed {since}). Ribbons below may be showing stale data, and "
+        "item lookups may fail. This clears itself automatically once the quota resets, no "
+        "action needed — please try again in a bit."
+        "</div>"
+    )
+
 
 def _cache_age_label(fetched_at: float) -> str:
     """Minutes since this box's data was last successfully (re)fetched from
@@ -75,7 +107,10 @@ def _cache_age_label(fetched_at: float) -> str:
     which can be much older than this even right after a successful refetch, since
     re-polling doesn't make Undermine's underlying snapshot any newer. A box here
     covering ~20 items also has no single well-defined "last updated" moment the
-    way one report page (one item) does."""
+    way one report page (one item) does. `fetched_at` is 0.0 if this box has never
+    successfully fetched anything yet (e.g. every attempt so far has been rate-limited)."""
+    if fetched_at <= 0.0:
+        return "not yet fetched"
     mins = int((time.monotonic() - fetched_at) // 60)
     return f"checked {mins}m ago" if mins > 0 else "checked just now"
 
@@ -102,7 +137,12 @@ def get_flask_overview_cached() -> list[dict]:
         rows = build_flask_overview(client, region="eu")
         _flask_overview_cache["rows"] = rows
         _flask_overview_cache["fetched_at"] = now
+        _mark_rate_limit_cleared()
         return rows
+    except UndermineApiError as exc:
+        if exc.status_code == 429:
+            _mark_rate_limited()
+        return _flask_overview_cache["rows"] or []
     except Exception:
         return _flask_overview_cache["rows"] or []
 
@@ -130,7 +170,12 @@ def get_flip_ribbon_cached() -> list[dict]:
         rows = build_flip_ribbon(client, region="eu", limit=16)
         _flip_ribbon_cache["rows"] = rows
         _flip_ribbon_cache["fetched_at"] = now
+        _mark_rate_limit_cleared()
         return rows
+    except UndermineApiError as exc:
+        if exc.status_code == 429:
+            _mark_rate_limited()
+        return _flip_ribbon_cache["rows"] or []
     except Exception:
         return _flip_ribbon_cache["rows"] or []
 
@@ -346,6 +391,17 @@ _PAGE_SHELL = """<!DOCTYPE html>
     font-size: 12px;
     line-height: 1.5;
     margin-top: 16px;
+  }
+  .rate-limit-banner {
+    width: 100%;
+    max-width: 1200px;
+    background: rgba(236,72,153,0.12);
+    border: 1px solid var(--pink);
+    color: #ffd6e8;
+    border-radius: 12px;
+    padding: 12px 18px;
+    font-size: 13px;
+    line-height: 1.5;
   }
 </style>
 </head>
@@ -621,8 +677,15 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
     region_options = "".join(
         f'<option value="{r}">{r.upper()}</option>' for r in REGIONS
     )
+    # Render the ribbons first — they're what actually talks to Undermine and updates
+    # _rate_limit_state — so the banner (rendered from that state right after) reflects
+    # what just happened on *this* request, not whatever the state was before it.
+    flip_ribbon_html = render_flip_ribbon()
+    flask_overview_html = render_flask_overview()
+    rate_limit_banner_html = _rate_limit_banner_html()
     body = f"""
-{render_flip_ribbon()}
+{rate_limit_banner_html}
+{flip_ribbon_html}
 <div class="box box-wide">
 <h1>WoW AH Sniper</h1>
 <div class="sub">Search any auction house item to see its live price dashboard.</div>
@@ -653,7 +716,7 @@ def render_search_page(error: str | None = None, query: str = "") -> str:
   behavior, or incomplete features. Thanks for your patience while improvements are
   being made!
 </div>
-{render_flask_overview()}
+{flask_overview_html}
 </div>
 {_FLIP_CAROUSEL_SCRIPT}
 """
@@ -717,6 +780,7 @@ def report():
         commodity, realm, quote, hourly = detect_scope(client, region, item_id, realm_override)
     except UndermineApiError as exc:
         if exc.status_code == 429:
+            _mark_rate_limited()
             return render_error_page(_RATE_LIMITED_MESSAGE, query), 429
         realm_desc = realm_override or DEFAULT_REALM
         return (
@@ -739,9 +803,11 @@ def report():
         )
     except UndermineApiError as exc:
         if exc.status_code == 429:
+            _mark_rate_limited()
             return render_error_page(_RATE_LIMITED_MESSAGE, query), 429
         return render_error_page(str(exc), query), 500
 
+    _mark_rate_limit_cleared()
     return Response(result["html"], mimetype="text/html")
 
 
