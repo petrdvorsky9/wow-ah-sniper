@@ -81,8 +81,10 @@ def _cache_age_label(fetched_at: float) -> str:
 
 
 # ── Midnight flask overview cache (avoids refetching on every landing-page hit) ─
+# Kept in lockstep with FLIP_RIBBON_TTL_SECONDS below so every landing-page ribbon
+# refreshes on the same cadence.
 
-FLASK_OVERVIEW_TTL_SECONDS = 600
+FLASK_OVERVIEW_TTL_SECONDS = 1200
 _flask_overview_cache: dict = {"rows": None, "fetched_at": 0.0}
 
 
@@ -106,6 +108,7 @@ def get_flask_overview_cached() -> list[dict]:
 
 
 # ── Midnight short-flip ribbon cache (avoids refetching on every landing-page hit) ─
+# Kept in lockstep with FLASK_OVERVIEW_TTL_SECONDS above.
 
 FLIP_RIBBON_TTL_SECONDS = 1200
 _flip_ribbon_cache: dict = {"rows": None, "fetched_at": 0.0}
