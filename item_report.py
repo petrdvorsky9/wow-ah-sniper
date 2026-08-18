@@ -1095,7 +1095,7 @@ def compute_hourly_heatmap(
     n = len(window)
     xs = list(range(n))
     ys = [float(s.price_copper) for s in window]
-    hours_of_day = [parse_dt(s.snapshot).hour for s in window]
+    hours_of_day = [parse_dt(s.snapshot).astimezone(LOCAL_TZ).hour for s in window]
     slope, intercept = _linear_regression(xs, ys)
     trend_last = max(0.0, slope * (n - 1) + intercept)
 
@@ -1152,7 +1152,7 @@ def compute_next_hour_flip(
     if not current_price_copper or current_price_copper <= 0 or not heatmap:
         return None
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(LOCAL_TZ)
     current_hour = now.hour
     next_hour = (now + timedelta(hours=1)).hour
     cur_cell = next(
@@ -2287,7 +2287,9 @@ def render_html_report(
         "dailyDates": [datetime.strptime(d, "%Y-%m-%d").strftime("%b %d") for d, _ in last_14],
         "dailyMin": [round(copper_to_gold(v["min"]), 2) for _, v in last_14],
         "dailyMax": [round(copper_to_gold(v["max"]), 2) for _, v in last_14],
-        "hourlyLabels": [parse_dt(s.snapshot).strftime("%b %d %Hh") for s in snapshots_7d],
+        "hourlyLabels": [
+            parse_dt(s.snapshot).astimezone(LOCAL_TZ).strftime("%b %d %Hh") for s in snapshots_7d
+        ],
         "hourlyPrice": [round(copper_to_gold(s.price_copper), 2) for s in snapshots_7d],
         "hourlyQty": [s.quantity for s in snapshots_7d],
         "prediction": prediction_js,
