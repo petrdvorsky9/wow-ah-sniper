@@ -183,7 +183,7 @@ _PAGE_SHELL = """<!DOCTYPE html>
     border-radius: 16px;
     padding: 28px 28px 24px;
   }
-  .box.box-wide { max-width: 620px; }
+  .box.box-wide { max-width: 760px; }
   .box.box-flip { max-width: 1200px; }
   @media (max-width: 480px) {
     body { padding: 20px 12px; align-items: flex-start; }
